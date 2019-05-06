@@ -15,23 +15,35 @@ package tikv
 
 import (
 	"bytes"
+	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/google/btree"
-	"github.com/juju/errors"
+	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/kvproto/pkg/metapb"
-	"github.com/pingcap/pd/pd-client"
+	"github.com/pingcap/pd/client"
 	"github.com/pingcap/tidb/metrics"
-	log "github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
+	"github.com/pingcap/tidb/util/logutil"
+	"go.uber.org/zap"
 )
 
 const (
 	btreeDegree             = 32
 	rcDefaultRegionCacheTTL = time.Minute * 10
+)
+
+var (
+	tikvRegionCacheCounterWithDropRegionFromCacheOK = metrics.TiKVRegionCacheCounter.WithLabelValues("drop_region_from_cache", "ok")
+	tikvRegionCacheCounterWithGetRegionByIDOK       = metrics.TiKVRegionCacheCounter.WithLabelValues("get_region_by_id", "ok")
+	tikvRegionCacheCounterWithGetRegionByIDError    = metrics.TiKVRegionCacheCounter.WithLabelValues("get_region_by_id", "err")
+	tikvRegionCacheCounterWithGetRegionOK           = metrics.TiKVRegionCacheCounter.WithLabelValues("get_region", "ok")
+	tikvRegionCacheCounterWithGetRegionError        = metrics.TiKVRegionCacheCounter.WithLabelValues("get_region", "err")
+	tikvRegionCacheCounterWithGetStoreOK            = metrics.TiKVRegionCacheCounter.WithLabelValues("get_store", "ok")
+	tikvRegionCacheCounterWithGetStoreError         = metrics.TiKVRegionCacheCounter.WithLabelValues("get_store", "err")
 )
 
 // CachedRegion encapsulates {Region, TTL}
@@ -88,6 +100,11 @@ func (c *RPCContext) GetStoreID() uint64 {
 	return 0
 }
 
+func (c *RPCContext) String() string {
+	return fmt.Sprintf("region ID: %d, meta: %s, peer: %s, addr: %s",
+		c.Region.GetID(), c.Meta, c.Peer, c.Addr)
+}
+
 // GetRPCContext returns RPCContext for a region. If it returns nil, the region
 // must be out of date and already dropped from cache.
 func (c *RegionCache) GetRPCContext(bo *Backoffer, id RegionVerID) (*RPCContext, error) {
@@ -137,7 +154,7 @@ func (l *KeyLocation) Contains(key []byte) bool {
 // LocateKey searches for the region and range that the key is located.
 func (c *RegionCache) LocateKey(bo *Backoffer, key []byte) (*KeyLocation, error) {
 	c.mu.RLock()
-	r := c.searchCachedRegion(key)
+	r := c.searchCachedRegion(key, false)
 	if r != nil {
 		loc := &KeyLocation{
 			Region:   r.VerID(),
@@ -149,7 +166,39 @@ func (c *RegionCache) LocateKey(bo *Backoffer, key []byte) (*KeyLocation, error)
 	}
 	c.mu.RUnlock()
 
-	r, err := c.loadRegion(bo, key)
+	r, err := c.loadRegion(bo, key, false)
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.insertRegionToCache(r)
+
+	return &KeyLocation{
+		Region:   r.VerID(),
+		StartKey: r.StartKey(),
+		EndKey:   r.EndKey(),
+	}, nil
+}
+
+// LocateEndKey searches for the region and range that the key is located.
+// Unlike LocateKey, start key of a region is exclusive and end key is inclusive.
+func (c *RegionCache) LocateEndKey(bo *Backoffer, key []byte) (*KeyLocation, error) {
+	c.mu.RLock()
+	r := c.searchCachedRegion(key, true)
+	if r != nil {
+		loc := &KeyLocation{
+			Region:   r.VerID(),
+			StartKey: r.StartKey(),
+			EndKey:   r.EndKey(),
+		}
+		c.mu.RUnlock()
+		return loc, nil
+	}
+	c.mu.RUnlock()
+
+	r, err := c.loadRegion(bo, key, true)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
@@ -249,12 +298,16 @@ func (c *RegionCache) UpdateLeader(regionID RegionVerID, leaderStoreID uint64) {
 
 	r := c.getCachedRegion(regionID)
 	if r == nil {
-		log.Debugf("regionCache: cannot find region when updating leader %d,%d", regionID, leaderStoreID)
+		logutil.Logger(context.Background()).Debug("regionCache: cannot find region when updating leader",
+			zap.Uint64("regionID", regionID.GetID()),
+			zap.Uint64("leaderStoreID", leaderStoreID))
 		return
 	}
 
 	if !r.SwitchPeer(leaderStoreID) {
-		log.Debugf("regionCache: cannot find peer when updating leader %d,%d", regionID, leaderStoreID)
+		logutil.Logger(context.Background()).Debug("regionCache: cannot find peer when updating leader",
+			zap.Uint64("regionID", regionID.GetID()),
+			zap.Uint64("leaderStoreID", leaderStoreID))
 		c.dropRegionFromCache(r.VerID())
 	}
 }
@@ -291,13 +344,18 @@ func (c *RegionCache) getCachedRegion(id RegionVerID) *Region {
 // searchCachedRegion finds a region from cache by key. Like `getCachedRegion`,
 // it should be called with c.mu.RLock(), and the returned Region should not be
 // used after c.mu is RUnlock().
-func (c *RegionCache) searchCachedRegion(key []byte) *Region {
+// If the given key is the end key of the region that you want, you may set the second argument to true. This is useful when processing in reverse order.
+func (c *RegionCache) searchCachedRegion(key []byte, isEndKey bool) *Region {
 	var r *Region
 	c.mu.sorted.DescendLessOrEqual(newBtreeSearchItem(key), func(item btree.Item) bool {
 		r = item.(*btreeItem).region
+		if isEndKey && bytes.Equal(r.StartKey(), key) {
+			r = nil     // clear result
+			return true // iterate next item
+		}
 		return false
 	})
-	if r != nil && r.Contains(key) {
+	if r != nil && (!isEndKey && r.Contains(key) || isEndKey && r.ContainsByEnd(key)) {
 		return c.getCachedRegion(r.VerID())
 	}
 	return nil
@@ -320,23 +378,36 @@ func (c *RegionCache) dropRegionFromCache(verID RegionVerID) {
 	if !ok {
 		return
 	}
-	metrics.TiKVRegionCacheCounter.WithLabelValues("drop_region_from_cache", metrics.RetLabel(nil)).Inc()
+	tikvRegionCacheCounterWithDropRegionFromCacheOK.Inc()
 	c.mu.sorted.Delete(newBtreeItem(r.region))
 	delete(c.mu.regions, verID)
 }
 
 // loadRegion loads region from pd client, and picks the first peer as leader.
-func (c *RegionCache) loadRegion(bo *Backoffer, key []byte) (*Region, error) {
+// If the given key is the end key of the region that you want, you may set the second argument to true. This is useful when processing in reverse order.
+func (c *RegionCache) loadRegion(bo *Backoffer, key []byte, isEndKey bool) (*Region, error) {
 	var backoffErr error
+	searchPrev := false
 	for {
 		if backoffErr != nil {
-			err := bo.Backoff(boPDRPC, backoffErr)
+			err := bo.Backoff(BoPDRPC, backoffErr)
 			if err != nil {
 				return nil, errors.Trace(err)
 			}
 		}
-		meta, leader, err := c.pdClient.GetRegion(bo.ctx, key)
-		metrics.TiKVRegionCacheCounter.WithLabelValues("get_region", metrics.RetLabel(err)).Inc()
+		var meta *metapb.Region
+		var leader *metapb.Peer
+		var err error
+		if searchPrev {
+			meta, leader, err = c.pdClient.GetPrevRegion(bo.ctx, key)
+		} else {
+			meta, leader, err = c.pdClient.GetRegion(bo.ctx, key)
+		}
+		if err != nil {
+			tikvRegionCacheCounterWithGetRegionError.Inc()
+		} else {
+			tikvRegionCacheCounterWithGetRegionOK.Inc()
+		}
 		if err != nil {
 			backoffErr = errors.Errorf("loadRegion from PD failed, key: %q, err: %v", key, err)
 			continue
@@ -347,6 +418,10 @@ func (c *RegionCache) loadRegion(bo *Backoffer, key []byte) (*Region, error) {
 		}
 		if len(meta.Peers) == 0 {
 			return nil, errors.New("receive Region with no peer")
+		}
+		if isEndKey && !searchPrev && bytes.Compare(meta.StartKey, key) == 0 && len(meta.StartKey) != 0 {
+			searchPrev = true
+			continue
 		}
 		region := &Region{
 			meta: meta,
@@ -364,13 +439,17 @@ func (c *RegionCache) loadRegionByID(bo *Backoffer, regionID uint64) (*Region, e
 	var backoffErr error
 	for {
 		if backoffErr != nil {
-			err := bo.Backoff(boPDRPC, backoffErr)
+			err := bo.Backoff(BoPDRPC, backoffErr)
 			if err != nil {
 				return nil, errors.Trace(err)
 			}
 		}
 		meta, leader, err := c.pdClient.GetRegionByID(bo.ctx, regionID)
-		metrics.TiKVRegionCacheCounter.WithLabelValues("get_region_by_id", metrics.RetLabel(err)).Inc()
+		if err != nil {
+			tikvRegionCacheCounterWithGetRegionByIDError.Inc()
+		} else {
+			tikvRegionCacheCounterWithGetRegionByIDOK.Inc()
+		}
 		if err != nil {
 			backoffErr = errors.Errorf("loadRegion from PD failed, regionID: %v, err: %v", regionID, err)
 			continue
@@ -431,13 +510,17 @@ func (c *RegionCache) ClearStoreByID(id uint64) {
 func (c *RegionCache) loadStoreAddr(bo *Backoffer, id uint64) (string, error) {
 	for {
 		store, err := c.pdClient.GetStore(bo.ctx, id)
-		metrics.TiKVRegionCacheCounter.WithLabelValues("get_store", metrics.RetLabel(err)).Inc()
+		if err != nil {
+			tikvRegionCacheCounterWithGetStoreError.Inc()
+		} else {
+			tikvRegionCacheCounterWithGetStoreOK.Inc()
+		}
 		if err != nil {
 			if errors.Cause(err) == context.Canceled {
 				return "", errors.Trace(err)
 			}
 			err = errors.Errorf("loadStore from PD failed, id: %d, err: %v", id, err)
-			if err = bo.Backoff(boPDRPC, err); err != nil {
+			if err = bo.Backoff(BoPDRPC, err); err != nil {
 				return "", errors.Trace(err)
 			}
 			continue
@@ -449,43 +532,62 @@ func (c *RegionCache) loadStoreAddr(bo *Backoffer, id uint64) (string, error) {
 	}
 }
 
-// OnRequestFail is used for clearing cache when a tikv server does not respond.
-func (c *RegionCache) OnRequestFail(ctx *RPCContext, err error) {
-	// Switch region's leader peer to next one.
-	regionID := ctx.Region
+// DropStoreOnSendRequestFail is used for clearing cache when a tikv server does not respond.
+func (c *RegionCache) DropStoreOnSendRequestFail(ctx *RPCContext, err error) {
+	// We need to drop the store only when the request is the first one failed on this store.
+	// Because too many concurrently requests trying to drop the store will be blocked on the lock.
+	failedRegionID := ctx.Region
+	failedStoreID := ctx.Peer.StoreId
 	c.mu.Lock()
-	if cachedregion, ok := c.mu.regions[regionID]; ok {
-		region := cachedregion.region
-		if !region.OnRequestFail(ctx.Peer.GetStoreId()) {
-			c.dropRegionFromCache(regionID)
-		}
+	_, ok := c.mu.regions[failedRegionID]
+	if !ok {
+		// The failed region is dropped already by another request, we don't need to iterate the regions
+		// and find regions on the failed store to drop.
+		c.mu.Unlock()
+		return
 	}
-	c.mu.Unlock()
-	// Store's meta may be out of date.
-	storeID := ctx.Peer.GetStoreId()
-	c.storeMu.Lock()
-	delete(c.storeMu.stores, storeID)
-	c.storeMu.Unlock()
-
-	log.Infof("drop regions of store %d from cache due to request fail, err: %v", storeID, err)
-
-	c.mu.Lock()
 	for id, r := range c.mu.regions {
-		if r.region.peer.GetStoreId() == storeID {
+		if r.region.peer.GetStoreId() == failedStoreID {
 			c.dropRegionFromCache(id)
 		}
 	}
 	c.mu.Unlock()
+
+	// Store's meta may be out of date.
+	var failedStoreAddr string
+	c.storeMu.Lock()
+	store, ok := c.storeMu.stores[failedStoreID]
+	if ok {
+		failedStoreAddr = store.Addr
+		delete(c.storeMu.stores, failedStoreID)
+	}
+	c.storeMu.Unlock()
+	logutil.Logger(context.Background()).Info("drop regions that on the store due to send request fail",
+		zap.Uint64("store", failedStoreID),
+		zap.String("store addr", failedStoreAddr),
+		zap.Error(err))
 }
 
-// OnRegionStale removes the old region and inserts new regions into the cache.
-func (c *RegionCache) OnRegionStale(ctx *RPCContext, newRegions []*metapb.Region) error {
+// OnRegionEpochNotMatch removes the old region and inserts new regions into the cache.
+func (c *RegionCache) OnRegionEpochNotMatch(bo *Backoffer, ctx *RPCContext, currentRegions []*metapb.Region) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
 	c.dropRegionFromCache(ctx.Region)
 
-	for _, meta := range newRegions {
+	// Find whether the region epoch in `ctx` is ahead of TiKV's. If so, backoff.
+	for _, meta := range currentRegions {
+		if meta.GetId() == ctx.Region.id &&
+			(meta.GetRegionEpoch().GetConfVer() < ctx.Region.confVer ||
+				meta.GetRegionEpoch().GetVersion() < ctx.Region.ver) {
+			err := errors.Errorf("region epoch is ahead of tikv. rpc ctx: %+v, currentRegions: %+v", ctx, currentRegions)
+			logutil.Logger(context.Background()).Info("region epoch is ahead of tikv", zap.Error(err))
+			return bo.Backoff(BoRegionMiss, err)
+		}
+	}
+
+	// If the region epoch is not ahead of TiKV's, replace region meta in region cache.
+	for _, meta := range currentRegions {
 		if _, ok := c.pdClient.(*codecPDClient); ok {
 			if err := decodeRegionMetaKey(meta); err != nil {
 				return errors.Errorf("newRegion's range key is not encoded: %v, %v", meta, err)
@@ -531,9 +633,8 @@ func (item *btreeItem) Less(other btree.Item) bool {
 
 // Region stores region's meta and its leader peer.
 type Region struct {
-	meta              *metapb.Region
-	peer              *metapb.Peer
-	unreachableStores []uint64
+	meta *metapb.Region
+	peer *metapb.Peer
 }
 
 // GetID returns id.
@@ -581,26 +682,6 @@ func (r *Region) GetContext() *kvrpcpb.Context {
 	}
 }
 
-// OnRequestFail records unreachable peer and tries to select another valid peer.
-// It returns false if all peers are unreachable.
-func (r *Region) OnRequestFail(storeID uint64) bool {
-	if r.peer.GetStoreId() != storeID {
-		return true
-	}
-	r.unreachableStores = append(r.unreachableStores, storeID)
-L:
-	for _, p := range r.meta.Peers {
-		for _, id := range r.unreachableStores {
-			if p.GetStoreId() == id {
-				continue L
-			}
-		}
-		r.peer = p
-		return true
-	}
-	return false
-}
-
 // SwitchPeer switches current peer to the one on specific store. It returns
 // false if no peer matches the storeID.
 func (r *Region) SwitchPeer(storeID uint64) bool {
@@ -618,6 +699,14 @@ func (r *Region) SwitchPeer(storeID uint64) bool {
 func (r *Region) Contains(key []byte) bool {
 	return bytes.Compare(r.meta.GetStartKey(), key) <= 0 &&
 		(bytes.Compare(key, r.meta.GetEndKey()) < 0 || len(r.meta.GetEndKey()) == 0)
+}
+
+// ContainsByEnd check the region contains the greatest key that is less than key.
+// for the maximum region endKey is empty.
+// startKey < key <= endKey.
+func (r *Region) ContainsByEnd(key []byte) bool {
+	return bytes.Compare(r.meta.GetStartKey(), key) < 0 &&
+		(bytes.Compare(key, r.meta.GetEndKey()) <= 0 || len(r.meta.GetEndKey()) == 0)
 }
 
 // Store contains a tikv server's address.

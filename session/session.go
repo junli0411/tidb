@@ -18,65 +18,105 @@
 package session
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/juju/errors"
 	"github.com/ngaut/pools"
 	"github.com/opentracing/opentracing-go"
-	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
+	"github.com/pingcap/parser"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/auth"
+	"github.com/pingcap/parser/charset"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/bindinfo"
+	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/executor"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/metrics"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/owner"
-	"github.com/pingcap/tidb/parser"
-	"github.com/pingcap/tidb/plan"
+	plannercore "github.com/pingcap/tidb/planner/core"
+	"github.com/pingcap/tidb/plugin"
 	"github.com/pingcap/tidb/privilege"
 	"github.com/pingcap/tidb/privilege/privileges"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/binloginfo"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/statistics"
-	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/tidb/statistics/handle"
+	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util"
-	"github.com/pingcap/tidb/util/auth"
-	"github.com/pingcap/tidb/util/charset"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/execdetails"
 	"github.com/pingcap/tidb/util/kvcache"
-	binlog "github.com/pingcap/tipb/go-binlog"
-	log "github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
+	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tidb/util/sqlexec"
+	"github.com/pingcap/tidb/util/timeutil"
+	"github.com/pingcap/tipb/go-binlog"
+	"go.uber.org/zap"
+)
+
+var (
+	statementPerTransactionInternalOK    = metrics.StatementPerTransaction.WithLabelValues(metrics.LblInternal, "ok")
+	statementPerTransactionInternalError = metrics.StatementPerTransaction.WithLabelValues(metrics.LblInternal, "error")
+	statementPerTransactionGeneralOK     = metrics.StatementPerTransaction.WithLabelValues(metrics.LblGeneral, "ok")
+	statementPerTransactionGeneralError  = metrics.StatementPerTransaction.WithLabelValues(metrics.LblGeneral, "error")
+	transactionDurationInternalOK        = metrics.TransactionDuration.WithLabelValues(metrics.LblInternal, "ok")
+	transactionDurationInternalError     = metrics.TransactionDuration.WithLabelValues(metrics.LblInternal, "error")
+	transactionDurationGeneralOK         = metrics.TransactionDuration.WithLabelValues(metrics.LblGeneral, "ok")
+	transactionDurationGeneralError      = metrics.TransactionDuration.WithLabelValues(metrics.LblGeneral, "error")
+
+	transactionCounterInternalOK  = metrics.TransactionCounter.WithLabelValues(metrics.LblInternal, metrics.LblOK)
+	transactionCounterInternalErr = metrics.TransactionCounter.WithLabelValues(metrics.LblInternal, metrics.LblError)
+	transactionCounterGeneralOK   = metrics.TransactionCounter.WithLabelValues(metrics.LblGeneral, metrics.LblOK)
+	transactionCounterGeneralErr  = metrics.TransactionCounter.WithLabelValues(metrics.LblGeneral, metrics.LblError)
+
+	transactionRollbackCounterInternal = metrics.TransactionCounter.WithLabelValues(metrics.LblInternal, metrics.LblRollback)
+	transactionRollbackCounterGeneral  = metrics.TransactionCounter.WithLabelValues(metrics.LblGeneral, metrics.LblRollback)
+
+	sessionExecuteRunDurationInternal = metrics.SessionExecuteRunDuration.WithLabelValues(metrics.LblInternal)
+	sessionExecuteRunDurationGeneral  = metrics.SessionExecuteRunDuration.WithLabelValues(metrics.LblGeneral)
+
+	sessionExecuteCompileDurationInternal = metrics.SessionExecuteCompileDuration.WithLabelValues(metrics.LblInternal)
+	sessionExecuteCompileDurationGeneral  = metrics.SessionExecuteCompileDuration.WithLabelValues(metrics.LblGeneral)
+	sessionExecuteParseDurationInternal   = metrics.SessionExecuteParseDuration.WithLabelValues(metrics.LblInternal)
+	sessionExecuteParseDurationGeneral    = metrics.SessionExecuteParseDuration.WithLabelValues(metrics.LblGeneral)
 )
 
 // Session context
 type Session interface {
 	sessionctx.Context
-	Status() uint16                                           // Flag of current status, such as autocommit.
-	LastInsertID() uint64                                     // LastInsertID is the last inserted auto_increment ID.
-	AffectedRows() uint64                                     // Affected rows by latest executed stmt.
-	Execute(context.Context, string) ([]ast.RecordSet, error) // Execute a sql statement.
-	String() string                                           // String is used to debug.
+	Status() uint16                                               // Flag of current status, such as autocommit.
+	LastInsertID() uint64                                         // LastInsertID is the last inserted auto_increment ID.
+	LastMessage() string                                          // LastMessage is the info message that may be generated by last command
+	AffectedRows() uint64                                         // Affected rows by latest executed stmt.
+	Execute(context.Context, string) ([]sqlexec.RecordSet, error) // Execute a sql statement.
+	String() string                                               // String is used to debug.
 	CommitTxn(context.Context) error
-	RollbackTxn(context.Context) error
+	RollbackTxn(context.Context)
 	// PrepareStmt executes prepare statement in binary protocol.
 	PrepareStmt(sql string) (stmtID uint32, paramCount int, fields []*ast.ResultField, err error)
 	// ExecutePreparedStmt executes a prepared statement.
-	ExecutePreparedStmt(ctx context.Context, stmtID uint32, param ...interface{}) (ast.RecordSet, error)
+	ExecutePreparedStmt(ctx context.Context, stmtID uint32, param ...interface{}) (sqlexec.RecordSet, error)
 	DropPreparedStmt(stmtID uint32) error
 	SetClientCapability(uint32) // Set client capability flags.
 	SetConnectionID(uint64)
+	SetCommandValue(byte)
+	SetProcessInfo(string, time.Time, byte)
 	SetTLSState(*tls.ConnectionState)
 	SetCollation(coID int) error
 	SetSessionManager(util.SessionManager)
@@ -95,7 +135,7 @@ var (
 
 type stmtRecord struct {
 	stmtID  uint32
-	st      ast.Statement
+	st      sqlexec.Statement
 	stmtCtx *stmtctx.StatementContext
 	params  []interface{}
 }
@@ -106,7 +146,7 @@ type StmtHistory struct {
 }
 
 // Add appends a stmt to history list.
-func (h *StmtHistory) Add(stmtID uint32, st ast.Statement, stmtCtx *stmtctx.StatementContext, params ...interface{}) {
+func (h *StmtHistory) Add(stmtID uint32, st sqlexec.Statement, stmtCtx *stmtctx.StatementContext, params ...interface{}) {
 	s := &stmtRecord{
 		stmtID:  stmtID,
 		st:      st,
@@ -131,6 +171,8 @@ type session struct {
 		values map[fmt.Stringer]interface{}
 	}
 
+	currentPlan plannercore.Plan
+
 	store kv.Storage
 
 	parser *parser.Parser
@@ -140,7 +182,7 @@ type session struct {
 	sessionVars    *variable.SessionVars
 	sessionManager util.SessionManager
 
-	statsCollector *statistics.SessionStatsCollector
+	statsCollector *handle.SessionStatsCollector
 	// ddlOwnerChecker is used in `select tidb_is_ddl_owner()` statement;
 	ddlOwnerChecker owner.DDLOwnerChecker
 }
@@ -151,7 +193,7 @@ func (s *session) DDLOwnerChecker() owner.DDLOwnerChecker {
 }
 
 func (s *session) getMembufCap() int {
-	if s.sessionVars.ImportingData {
+	if s.sessionVars.LightningMode {
 		return kv.ImportingTxnMembufCap
 	}
 
@@ -159,12 +201,32 @@ func (s *session) getMembufCap() int {
 }
 
 func (s *session) cleanRetryInfo() {
-	if !s.sessionVars.RetryInfo.Retrying {
-		retryInfo := s.sessionVars.RetryInfo
-		for _, stmtID := range retryInfo.DroppedPreparedStmtIDs {
-			delete(s.sessionVars.PreparedStmts, stmtID)
+	if s.sessionVars.RetryInfo.Retrying {
+		return
+	}
+
+	retryInfo := s.sessionVars.RetryInfo
+	defer retryInfo.Clean()
+	if len(retryInfo.DroppedPreparedStmtIDs) == 0 {
+		return
+	}
+
+	planCacheEnabled := plannercore.PreparedPlanCacheEnabled()
+	var cacheKey kvcache.Key
+	if planCacheEnabled {
+		firstStmtID := retryInfo.DroppedPreparedStmtIDs[0]
+		cacheKey = plannercore.NewPSTMTPlanCacheKey(
+			s.sessionVars, firstStmtID, s.sessionVars.PreparedStmts[firstStmtID].SchemaVersion,
+		)
+	}
+	for i, stmtID := range retryInfo.DroppedPreparedStmtIDs {
+		if planCacheEnabled {
+			if i > 0 {
+				plannercore.SetPstmtIDSchemaVersion(cacheKey, stmtID, s.sessionVars.PreparedStmts[stmtID].SchemaVersion)
+			}
+			s.PreparedPlanCache().Delete(cacheKey)
 		}
-		retryInfo.Clean()
+		s.sessionVars.RemovePreparedStmt(stmtID)
 	}
 }
 
@@ -173,10 +235,14 @@ func (s *session) Status() uint16 {
 }
 
 func (s *session) LastInsertID() uint64 {
-	if s.sessionVars.LastInsertID > 0 {
-		return s.sessionVars.LastInsertID
+	if s.sessionVars.StmtCtx.LastInsertID > 0 {
+		return s.sessionVars.StmtCtx.LastInsertID
 	}
-	return s.sessionVars.InsertID
+	return s.sessionVars.StmtCtx.InsertID
+}
+
+func (s *session) LastMessage() string {
+	return s.sessionVars.StmtCtx.GetMessage()
 }
 
 func (s *session) AffectedRows() uint64 {
@@ -198,6 +264,10 @@ func (s *session) SetTLSState(tlsState *tls.ConnectionState) {
 	}
 }
 
+func (s *session) SetCommandValue(command byte) {
+	atomic.StoreUint32(&s.sessionVars.CommandValue, uint32(command))
+}
+
 func (s *session) GetTLSState() *tls.ConnectionState {
 	return s.sessionVars.TLSConnectionState
 }
@@ -205,12 +275,12 @@ func (s *session) GetTLSState() *tls.ConnectionState {
 func (s *session) SetCollation(coID int) error {
 	cs, co, err := charset.GetCharsetInfoByID(coID)
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
 	for _, v := range variable.SetNamesVariables {
-		terror.Log(errors.Trace(s.sessionVars.SetSystemVar(v, cs)))
+		terror.Log(s.sessionVars.SetSystemVar(v, cs))
 	}
-	terror.Log(errors.Trace(s.sessionVars.SetSystemVar(variable.CollationConnection, co)))
+	terror.Log(s.sessionVars.SetSystemVar(variable.CollationConnection, co))
 	return nil
 }
 
@@ -228,7 +298,19 @@ func (s *session) GetSessionManager() util.SessionManager {
 
 func (s *session) StoreQueryFeedback(feedback interface{}) {
 	if s.statsCollector != nil {
-		s.statsCollector.StoreQueryFeedback(feedback)
+		do, err := GetDomain(s.store)
+		if err != nil {
+			logutil.Logger(context.Background()).Debug("domain not found", zap.Error(err))
+			metrics.StoreQueryFeedbackCounter.WithLabelValues(metrics.LblError).Inc()
+			return
+		}
+		err = s.statsCollector.StoreQueryFeedback(feedback, do.StatsHandle())
+		if err != nil {
+			logutil.Logger(context.Background()).Debug("store query feedback", zap.Error(err))
+			metrics.StoreQueryFeedbackCounter.WithLabelValues(metrics.LblError).Inc()
+			return
+		}
+		metrics.StoreQueryFeedbackCounter.WithLabelValues(metrics.LblOK).Inc()
 	}
 }
 
@@ -239,7 +321,7 @@ func (s *session) FieldList(tableName string) ([]*ast.ResultField, error) {
 	tName := model.NewCIStr(tableName)
 	table, err := is.TableByName(dbName, tName)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 
 	cols := table.Cols()
@@ -257,38 +339,8 @@ func (s *session) FieldList(tableName string) ([]*ast.ResultField, error) {
 	return fields, nil
 }
 
-type schemaLeaseChecker struct {
-	domain.SchemaValidator
-	schemaVer       int64
-	relatedTableIDs []int64
-}
-
-var (
-	// SchemaOutOfDateRetryInterval is the sleeping time when we fail to try.
-	SchemaOutOfDateRetryInterval = int64(500 * time.Millisecond)
-	// SchemaOutOfDateRetryTimes is upper bound of retry times when the schema is out of date.
-	SchemaOutOfDateRetryTimes = int32(10)
-)
-
-func (s *schemaLeaseChecker) Check(txnTS uint64) error {
-	schemaOutOfDateRetryInterval := atomic.LoadInt64(&SchemaOutOfDateRetryInterval)
-	schemaOutOfDateRetryTimes := int(atomic.LoadInt32(&SchemaOutOfDateRetryTimes))
-	for i := 0; i < schemaOutOfDateRetryTimes; i++ {
-		result := s.SchemaValidator.Check(txnTS, s.schemaVer, s.relatedTableIDs)
-		switch result {
-		case domain.ResultSucc:
-			return nil
-		case domain.ResultFail:
-			metrics.SchemaLeaseErrorCounter.WithLabelValues("changed").Inc()
-			return domain.ErrInfoSchemaChanged
-		case domain.ResultUnknown:
-			metrics.SchemaLeaseErrorCounter.WithLabelValues("outdated").Inc()
-			time.Sleep(time.Duration(schemaOutOfDateRetryInterval))
-		}
-
-	}
-	return domain.ErrInfoSchemaExpired
-}
+// mockCommitErrorOnce use to make sure gofail mockCommitError only mock commit error once.
+var mockCommitErrorOnce = true
 
 func (s *session) doCommit(ctx context.Context) error {
 	if !s.txn.Valid() {
@@ -298,6 +350,18 @@ func (s *session) doCommit(ctx context.Context) error {
 		s.txn.changeToInvalid()
 		s.sessionVars.SetStatusFlag(mysql.ServerStatusInTrans, false)
 	}()
+	if s.txn.IsReadOnly() {
+		return nil
+	}
+
+	// mockCommitError and mockGetTSErrorInRetry use to test PR #8743.
+	failpoint.Inject("mockCommitError", func(val failpoint.Value) {
+		if val.(bool) && mockCommitErrorOnce {
+			mockCommitErrorOnce = false
+			failpoint.Return(kv.ErrRetryable)
+		}
+	})
+
 	if s.sessionVars.BinlogClient != nil {
 		prewriteValue := binloginfo.GetPrewriteValue(s, false)
 		if prewriteValue != nil {
@@ -310,7 +374,7 @@ func (s *session) doCommit(ctx context.Context) error {
 					Tp:            binlog.BinlogType_Prewrite,
 					PrewriteValue: prewriteData,
 				},
-				Client: s.sessionVars.BinlogClient.(binlog.PumpClient),
+				Client: s.sessionVars.BinlogClient,
 			}
 			s.txn.SetOption(kv.BinlogInfo, info)
 		}
@@ -323,19 +387,9 @@ func (s *session) doCommit(ctx context.Context) error {
 		tableIDs = append(tableIDs, id)
 	}
 	// Set this option for 2 phase commit to validate schema lease.
-	s.txn.SetOption(kv.SchemaLeaseChecker, &schemaLeaseChecker{
-		SchemaValidator: domain.GetDomain(s).SchemaValidator,
-		schemaVer:       s.sessionVars.TxnCtx.SchemaVersion,
-		relatedTableIDs: tableIDs,
-	})
-	if s.sessionVars.TxnCtx.ForUpdate {
-		s.txn.SetOption(kv.ForUpdate, true)
-	}
+	s.txn.SetOption(kv.SchemaChecker, domain.NewSchemaChecker(domain.GetDomain(s), s.sessionVars.TxnCtx.SchemaVersion, tableIDs))
 
-	if err := s.txn.Commit(sessionctx.SetCommitCtx(ctx, s)); err != nil {
-		return errors.Trace(err)
-	}
-	return nil
+	return s.txn.Commit(sessionctx.SetCommitCtx(ctx, s))
 }
 
 func (s *session) doCommitWithRetry(ctx context.Context) error {
@@ -346,11 +400,23 @@ func (s *session) doCommitWithRetry(ctx context.Context) error {
 	err := s.doCommit(ctx)
 	if err != nil {
 		commitRetryLimit := s.sessionVars.RetryLimit
+		if s.sessionVars.DisableTxnAutoRetry && !s.sessionVars.InRestrictedSQL {
+			// Do not retry non-autocommit transactions.
+			// For autocommit single statement transactions, the history count is always 1.
+			// For explicit transactions, the statement count is more than 1.
+			history := GetHistory(s)
+			if history.Count() > 1 {
+				commitRetryLimit = 0
+			}
+		}
 		// Don't retry in BatchInsert mode. As a counter-example, insert into t1 select * from t2,
 		// BatchInsert already commit the first batch 1000 rows, then it commit 1000-2000 and retry the statement,
 		// Finally t1 will have more data than t2, with no errors return to user!
 		if s.isRetryableError(err) && !s.sessionVars.BatchInsert && commitRetryLimit > 0 {
-			log.Warnf("[con:%d] retryable error: %v, txn: %v", s.sessionVars.ConnectionID, err, s.txn)
+			logutil.Logger(ctx).Warn("sql",
+				zap.String("label", s.getSQLLabel()),
+				zap.Error(err),
+				zap.String("txn", s.txn.GoString()))
 			// Transactions will retry 2 ~ commitRetryLimit times.
 			// We make larger transactions retry less times to prevent cluster resource outage.
 			txnSizeRate := float64(txnSize) / float64(kv.TxnTotalSizeLimit)
@@ -360,8 +426,7 @@ func (s *session) doCommitWithRetry(ctx context.Context) error {
 	}
 	counter := s.sessionVars.TxnCtx.StatementCount
 	duration := time.Since(s.GetSessionVars().TxnCtx.CreateTime).Seconds()
-	metrics.StatementPerTransaction.WithLabelValues(metrics.RetLabel(err)).Observe(float64(counter))
-	metrics.TransactionDuration.WithLabelValues(metrics.RetLabel(err)).Observe(float64(duration))
+	s.recordOnTransactionExecution(err, counter, duration)
 	s.cleanRetryInfo()
 
 	if isoLevelOneShot := &s.sessionVars.TxnIsolationLevelOneShot; isoLevelOneShot.State != 0 {
@@ -375,8 +440,10 @@ func (s *session) doCommitWithRetry(ctx context.Context) error {
 	}
 
 	if err != nil {
-		log.Warnf("[con:%d] finished txn:%v, %v", s.sessionVars.ConnectionID, s.txn, err)
-		return errors.Trace(err)
+		logutil.Logger(ctx).Warn("commit failed",
+			zap.String("finished txn", s.txn.GoString()),
+			zap.Error(err))
+		return err
 	}
 	mapper := s.GetSessionVars().TxnCtx.TableDeltaMap
 	if s.statsCollector != nil && mapper != nil {
@@ -388,35 +455,40 @@ func (s *session) doCommitWithRetry(ctx context.Context) error {
 }
 
 func (s *session) CommitTxn(ctx context.Context) error {
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		span = opentracing.StartSpan("session.CommitTxn", opentracing.ChildOf(span.Context()))
-		defer span.Finish()
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("session.CommitTxn", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
 	}
 
+	var commitDetail *execdetails.CommitDetails
+	ctx = context.WithValue(ctx, execdetails.CommitDetailCtxKey, &commitDetail)
 	err := s.doCommitWithRetry(ctx)
-	label := metrics.LblOK
-	if err != nil {
-		label = metrics.LblError
+	if commitDetail != nil {
+		s.sessionVars.StmtCtx.MergeExecDetails(nil, commitDetail)
 	}
-	metrics.TransactionCounter.WithLabelValues(label).Inc()
-	return errors.Trace(err)
+	s.sessionVars.TxnCtx.Cleanup()
+	s.recordTransactionCounter(err)
+	return err
 }
 
-func (s *session) RollbackTxn(ctx context.Context) error {
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		span = opentracing.StartSpan("session.RollbackTxn", opentracing.ChildOf(span.Context()))
-		defer span.Finish()
+func (s *session) RollbackTxn(ctx context.Context) {
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("session.RollbackTxn", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
 	}
 
-	var err error
 	if s.txn.Valid() {
 		terror.Log(s.txn.Rollback())
-		metrics.TransactionCounter.WithLabelValues(metrics.LblRollback).Inc()
+		if s.isInternal() {
+			transactionRollbackCounterInternal.Inc()
+		} else {
+			transactionRollbackCounterGeneral.Inc()
+		}
 	}
 	s.cleanRetryInfo()
 	s.txn.changeToInvalid()
+	s.sessionVars.TxnCtx.Cleanup()
 	s.sessionVars.SetStatusFlag(mysql.ServerStatusInTrans, false)
-	return errors.Trace(err)
 }
 
 func (s *session) GetClient() kv.Client {
@@ -440,8 +512,8 @@ func (s *session) String() string {
 	if sessVars.SnapshotTS != 0 {
 		data["snapshotTS"] = sessVars.SnapshotTS
 	}
-	if sessVars.LastInsertID > 0 {
-		data["lastInsertID"] = sessVars.LastInsertID
+	if sessVars.StmtCtx.LastInsertID > 0 {
+		data["lastInsertID"] = sessVars.StmtCtx.LastInsertID
 	}
 	if len(sessVars.PreparedStmts) > 0 {
 		data["preparedStmtCount"] = len(sessVars.PreparedStmts)
@@ -456,6 +528,17 @@ const sqlLogMaxLen = 1024
 // SchemaChangedWithoutRetry is used for testing.
 var SchemaChangedWithoutRetry bool
 
+func (s *session) getSQLLabel() string {
+	if s.sessionVars.InRestrictedSQL {
+		return metrics.LblInternal
+	}
+	return metrics.LblGeneral
+}
+
+func (s *session) isInternal() bool {
+	return s.sessionVars.InRestrictedSQL
+}
+
 func (s *session) isRetryableError(err error) bool {
 	if SchemaChangedWithoutRetry {
 		return kv.IsRetryableError(err)
@@ -463,56 +546,86 @@ func (s *session) isRetryableError(err error) bool {
 	return kv.IsRetryableError(err) || domain.ErrInfoSchemaChanged.Equal(err)
 }
 
-func (s *session) retry(ctx context.Context, maxCnt uint) error {
-	span, ctx := opentracing.StartSpanFromContext(ctx, "retry")
-	defer span.Finish()
-
-	connID := s.sessionVars.ConnectionID
-	if s.sessionVars.TxnCtx.ForUpdate {
-		return errForUpdateCantRetry.GenByArgs(connID)
+func (s *session) checkTxnAborted(stmt sqlexec.Statement) error {
+	if s.txn.doNotCommit == nil {
+		return nil
 	}
-	s.sessionVars.RetryInfo.Retrying = true
+	// If the transaction is aborted, the following statements do not need to execute, except `commit` and `rollback`,
+	// because they are used to finish the aborted transaction.
+	if _, ok := stmt.(*executor.ExecStmt).StmtNode.(*ast.CommitStmt); ok {
+		return nil
+	}
+	if _, ok := stmt.(*executor.ExecStmt).StmtNode.(*ast.RollbackStmt); ok {
+		return nil
+	}
+	return errors.New("current transaction is aborted, commands ignored until end of transaction block")
+}
+
+func (s *session) retry(ctx context.Context, maxCnt uint) (err error) {
 	var retryCnt uint
 	defer func() {
 		s.sessionVars.RetryInfo.Retrying = false
-		s.txn.changeToInvalid()
 		// retryCnt only increments on retryable error, so +1 here.
 		metrics.SessionRetry.Observe(float64(retryCnt + 1))
 		s.sessionVars.SetStatusFlag(mysql.ServerStatusInTrans, false)
+		if err != nil {
+			s.RollbackTxn(ctx)
+		}
+		s.txn.changeToInvalid()
 	}()
 
+	connID := s.sessionVars.ConnectionID
+	s.sessionVars.RetryInfo.Retrying = true
+	if s.sessionVars.TxnCtx.ForUpdate {
+		err = errForUpdateCantRetry.GenWithStackByArgs(connID)
+		return err
+	}
+
 	nh := GetHistory(s)
-	var err error
 	var schemaVersion int64
+	sessVars := s.GetSessionVars()
+	orgStartTS := sessVars.TxnCtx.StartTS
+	label := s.getSQLLabel()
 	for {
 		s.PrepareTxnCtx(ctx)
 		s.sessionVars.RetryInfo.ResetOffset()
 		for i, sr := range nh.history {
 			st := sr.st
-			if st.IsReadOnly() {
-				continue
-			}
+			s.sessionVars.StmtCtx = sr.stmtCtx
+			s.sessionVars.StmtCtx.ResetForRetry()
+			s.sessionVars.PreparedParams = s.sessionVars.PreparedParams[:0]
 			schemaVersion, err = st.RebuildPlan()
 			if err != nil {
-				return errors.Trace(err)
+				return err
 			}
 
 			if retryCnt == 0 {
 				// We do not have to log the query every time.
 				// We print the queries at the first try only.
-				log.Warnf("[con:%d][schema ver:%d] Retry:%d query:%d %s", connID, schemaVersion, retryCnt, i, sqlForLog(st.OriginText()))
+				logutil.Logger(ctx).Warn("retrying",
+					zap.Int64("schemaVersion", schemaVersion),
+					zap.Uint("retryCnt", retryCnt),
+					zap.Int("queryNum", i),
+					zap.String("sql", sqlForLog(st.OriginText())+sessVars.GetExecuteArgumentsInfo()))
 			} else {
-				log.Warnf("[con:%d][schema ver:%d] Retry:%d query:%d", connID, schemaVersion, retryCnt, i)
+				logutil.Logger(ctx).Warn("retrying",
+					zap.Int64("schemaVersion", schemaVersion),
+					zap.Uint("retryCnt", retryCnt),
+					zap.Int("queryNum", i))
 			}
-			s.sessionVars.StmtCtx = sr.stmtCtx
-			s.sessionVars.StmtCtx.ResetForRetry()
 			_, err = st.Exec(ctx)
 			if err != nil {
 				s.StmtRollback()
 				break
 			}
-			s.StmtCommit()
+			err = s.StmtCommit()
+			if err != nil {
+				return err
+			}
 		}
+		logutil.Logger(ctx).Warn("transaction association",
+			zap.Uint64("retrying txnStartTS", s.GetSessionVars().TxnCtx.StartTS),
+			zap.Uint64("original txnStartTS", orgStartTS))
 		if hook := ctx.Value("preCommitHook"); hook != nil {
 			// For testing purpose.
 			hook.(func())()
@@ -524,17 +637,25 @@ func (s *session) retry(ctx context.Context, maxCnt uint) error {
 			}
 		}
 		if !s.isRetryableError(err) {
-			log.Warnf("[con:%d] session:%v, err:%v in retry", connID, s, err)
-			metrics.SessionRetryErrorCounter.WithLabelValues(metrics.LblUnretryable)
-			return errors.Trace(err)
+			logutil.Logger(ctx).Warn("sql",
+				zap.String("label", label),
+				zap.Stringer("session", s),
+				zap.Error(err))
+			metrics.SessionRetryErrorCounter.WithLabelValues(label, metrics.LblUnretryable)
+			return err
 		}
 		retryCnt++
 		if retryCnt >= maxCnt {
-			log.Warnf("[con:%d] Retry reached max count %d", connID, retryCnt)
-			metrics.SessionRetryErrorCounter.WithLabelValues(metrics.LblReachMax)
-			return errors.Trace(err)
+			logutil.Logger(ctx).Warn("sql",
+				zap.String("label", label),
+				zap.Uint("retry reached max count", retryCnt))
+			metrics.SessionRetryErrorCounter.WithLabelValues(label, metrics.LblReachMax)
+			return err
 		}
-		log.Warnf("[con:%d] retryable error: %v, txn: %v", connID, err, s.txn)
+		logutil.Logger(ctx).Warn("sql",
+			zap.String("label", label),
+			zap.Error(err),
+			zap.String("txn", s.txn.GoString()))
 		kv.BackOff(retryCnt)
 		s.txn.changeToInvalid()
 		s.sessionVars.SetStatusFlag(mysql.ServerStatusInTrans, false)
@@ -544,12 +665,17 @@ func (s *session) retry(ctx context.Context, maxCnt uint) error {
 
 func sqlForLog(sql string) string {
 	if len(sql) > sqlLogMaxLen {
-		return sql[:sqlLogMaxLen] + fmt.Sprintf("(len:%d)", len(sql))
+		sql = sql[:sqlLogMaxLen] + fmt.Sprintf("(len:%d)", len(sql))
 	}
-	return sql
+	return executor.QueryReplacer.Replace(sql)
 }
 
-func (s *session) sysSessionPool() *pools.ResourcePool {
+type sessionPool interface {
+	Get() (pools.Resource, error)
+	Put(pools.Resource)
+}
+
+func (s *session) sysSessionPool() sessionPool {
 	return domain.GetDomain(s).SysSessionPool()
 }
 
@@ -557,38 +683,80 @@ func (s *session) sysSessionPool() *pools.ResourcePool {
 // This is used for executing some restricted sql statements, usually executed during a normal statement execution.
 // Unlike normal Exec, it doesn't reset statement status, doesn't commit or rollback the current transaction
 // and doesn't write binlog.
-func (s *session) ExecRestrictedSQL(sctx sessionctx.Context, sql string) ([]types.Row, []*ast.ResultField, error) {
-	var span opentracing.Span
+func (s *session) ExecRestrictedSQL(sctx sessionctx.Context, sql string) ([]chunk.Row, []*ast.ResultField, error) {
 	ctx := context.TODO()
-	span, ctx = opentracing.StartSpanFromContext(ctx, "session.ExecRestrictedSQL")
-	defer span.Finish()
 
 	// Use special session to execute the sql.
 	tmp, err := s.sysSessionPool().Get()
 	if err != nil {
-		return nil, nil, errors.Trace(err)
+		return nil, nil, err
 	}
 	se := tmp.(*session)
 	defer s.sysSessionPool().Put(tmp)
 	metrics.SessionRestrictedSQLCounter.Inc()
 
+	return execRestrictedSQL(ctx, se, sql)
+}
+
+// ExecRestrictedSQLWithSnapshot implements RestrictedSQLExecutor interface.
+// This is used for executing some restricted sql statements with snapshot.
+// If current session sets the snapshot timestamp, then execute with this snapshot timestamp.
+// Otherwise, execute with the current transaction start timestamp if the transaction is valid.
+func (s *session) ExecRestrictedSQLWithSnapshot(sctx sessionctx.Context, sql string) ([]chunk.Row, []*ast.ResultField, error) {
+	ctx := context.TODO()
+
+	// Use special session to execute the sql.
+	tmp, err := s.sysSessionPool().Get()
+	if err != nil {
+		return nil, nil, err
+	}
+	se := tmp.(*session)
+	defer s.sysSessionPool().Put(tmp)
+	metrics.SessionRestrictedSQLCounter.Inc()
+	var snapshot uint64
+	txn, err := s.Txn(false)
+	if err != nil {
+		return nil, nil, err
+	}
+	if txn.Valid() {
+		snapshot = s.txn.StartTS()
+	}
+	if s.sessionVars.SnapshotTS != 0 {
+		snapshot = s.sessionVars.SnapshotTS
+	}
+	// Set snapshot.
+	if snapshot != 0 {
+		if err := se.sessionVars.SetSystemVar(variable.TiDBSnapshot, strconv.FormatUint(snapshot, 10)); err != nil {
+			return nil, nil, err
+		}
+		defer func() {
+			if err := se.sessionVars.SetSystemVar(variable.TiDBSnapshot, ""); err != nil {
+				logutil.Logger(context.Background()).Error("set tidbSnapshot error", zap.Error(err))
+			}
+		}()
+	}
+	return execRestrictedSQL(ctx, se, sql)
+}
+
+func execRestrictedSQL(ctx context.Context, se *session, sql string) ([]chunk.Row, []*ast.ResultField, error) {
+	startTime := time.Now()
 	recordSets, err := se.Execute(ctx, sql)
 	if err != nil {
-		return nil, nil, errors.Trace(err)
+		return nil, nil, err
 	}
 
 	var (
-		rows   []types.Row
+		rows   []chunk.Row
 		fields []*ast.ResultField
 	)
 	// Execute all recordset, take out the first one as result.
 	for i, rs := range recordSets {
-		tmp, err := drainRecordSet(ctx, rs)
+		tmp, err := drainRecordSet(ctx, se, rs)
 		if err != nil {
-			return nil, nil, errors.Trace(err)
+			return nil, nil, err
 		}
 		if err = rs.Close(); err != nil {
-			return nil, nil, errors.Trace(err)
+			return nil, nil, err
 		}
 
 		if i == 0 {
@@ -596,6 +764,7 @@ func (s *session) ExecRestrictedSQL(sctx sessionctx.Context, sql string) ([]type
 			fields = rs.Fields()
 		}
 	}
+	metrics.QueryDurationHistogram.WithLabelValues(metrics.LblInternal).Observe(time.Since(startTime).Seconds())
 	return rows, fields, nil
 }
 
@@ -603,11 +772,11 @@ func createSessionFunc(store kv.Storage) pools.Factory {
 	return func() (pools.Resource, error) {
 		se, err := createSession(store)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, err
 		}
 		err = variable.SetSessionSystemVar(se.sessionVars, variable.AutocommitVar, types.NewStringDatum("1"))
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, err
 		}
 		se.sessionVars.CommonGlobalLoaded = true
 		se.sessionVars.InRestrictedSQL = true
@@ -619,11 +788,11 @@ func createSessionWithDomainFunc(store kv.Storage) func(*domain.Domain) (pools.R
 	return func(dom *domain.Domain) (pools.Resource, error) {
 		se, err := createSessionWithDomain(store, dom)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, err
 		}
 		err = variable.SetSessionSystemVar(se.sessionVars, variable.AutocommitVar, types.NewStringDatum("1"))
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, err
 		}
 		se.sessionVars.CommonGlobalLoaded = true
 		se.sessionVars.InRestrictedSQL = true
@@ -631,18 +800,19 @@ func createSessionWithDomainFunc(store kv.Storage) func(*domain.Domain) (pools.R
 	}
 }
 
-func drainRecordSet(ctx context.Context, rs ast.RecordSet) ([]types.Row, error) {
-	var rows []types.Row
+func drainRecordSet(ctx context.Context, se *session, rs sqlexec.RecordSet) ([]chunk.Row, error) {
+	var rows []chunk.Row
+	req := rs.NewRecordBatch()
 	for {
-		chk := rs.NewChunk()
-		err := rs.Next(ctx, chk)
-		if err != nil || chk.NumRows() == 0 {
-			return rows, errors.Trace(err)
+		err := rs.Next(ctx, req)
+		if err != nil || req.NumRows() == 0 {
+			return rows, err
 		}
-		iter := chunk.NewIterator4Chunk(chk)
+		iter := chunk.NewIterator4Chunk(req.Chunk)
 		for r := iter.Begin(); r != iter.End(); r = iter.Next() {
 			rows = append(rows, r)
 		}
+		req.Chunk = chunk.Renew(req.Chunk, se.sessionVars.MaxChunkSize)
 	}
 }
 
@@ -651,7 +821,7 @@ func drainRecordSet(ctx context.Context, rs ast.RecordSet) ([]types.Row, error) 
 func (s *session) getExecRet(ctx sessionctx.Context, sql string) (string, error) {
 	rows, fields, err := s.ExecRestrictedSQL(ctx, sql)
 	if err != nil {
-		return "", errors.Trace(err)
+		return "", err
 	}
 	if len(rows) == 0 {
 		return "", executor.ErrResultIsEmpty
@@ -659,7 +829,7 @@ func (s *session) getExecRet(ctx sessionctx.Context, sql string) (string, error)
 	d := rows[0].GetDatum(0, &fields[0].Column.FieldType)
 	value, err := d.ToString()
 	if err != nil {
-		return "", errors.Trace(err)
+		return "", err
 	}
 	return value, nil
 }
@@ -673,7 +843,7 @@ func (s *session) GetAllSysVars() (map[string]string, error) {
 	sql = fmt.Sprintf(sql, mysql.SystemDB, mysql.GlobalVariablesTable)
 	rows, _, err := s.ExecRestrictedSQL(s, sql)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 	ret := make(map[string]string)
 	for _, r := range rows {
@@ -697,42 +867,51 @@ func (s *session) GetGlobalSysVar(name string) (string, error) {
 			if sv, ok := variable.SysVars[name]; ok {
 				return sv.Value, nil
 			}
-			return "", variable.UnknownSystemVar.GenByArgs(name)
+			return "", variable.UnknownSystemVar.GenWithStackByArgs(name)
 		}
-		return "", errors.Trace(err)
+		return "", err
 	}
 	return sysVar, nil
 }
 
 // SetGlobalSysVar implements GlobalVarAccessor.SetGlobalSysVar interface.
-func (s *session) SetGlobalSysVar(name string, value string) error {
+func (s *session) SetGlobalSysVar(name, value string) error {
 	if name == variable.SQLModeVar {
 		value = mysql.FormatSQLModeStr(value)
 		if _, err := mysql.GetSQLMode(value); err != nil {
-			return errors.Trace(err)
+			return err
 		}
 	}
+	var sVal string
+	var err error
+	sVal, err = variable.ValidateSetSystemVar(s.sessionVars, name, value)
+	if err != nil {
+		return err
+	}
+	name = strings.ToLower(name)
 	sql := fmt.Sprintf(`REPLACE %s.%s VALUES ('%s', '%s');`,
-		mysql.SystemDB, mysql.GlobalVariablesTable, strings.ToLower(name), value)
-	_, _, err := s.ExecRestrictedSQL(s, sql)
-	return errors.Trace(err)
+		mysql.SystemDB, mysql.GlobalVariablesTable, name, sVal)
+	_, _, err = s.ExecRestrictedSQL(s, sql)
+	return err
 }
 
-func (s *session) ParseSQL(ctx context.Context, sql, charset, collation string) ([]ast.StmtNode, error) {
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		span1 := opentracing.StartSpan("session.ParseSQL", opentracing.ChildOf(span.Context()))
+func (s *session) ParseSQL(ctx context.Context, sql, charset, collation string) ([]ast.StmtNode, []error, error) {
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("session.ParseSQL", opentracing.ChildOf(span.Context()))
 		defer span1.Finish()
 	}
 	s.parser.SetSQLMode(s.sessionVars.SQLMode)
+	s.parser.EnableWindowFunc(s.sessionVars.EnableWindowFunction)
 	return s.parser.Parse(sql, charset, collation)
 }
 
-func (s *session) SetProcessInfo(sql string) {
+func (s *session) SetProcessInfo(sql string, t time.Time, command byte) {
 	pi := util.ProcessInfo{
 		ID:      s.sessionVars.ConnectionID,
 		DB:      s.sessionVars.CurrentDB,
-		Command: "Query",
-		Time:    time.Now(),
+		Command: command,
+		Plan:    s.currentPlan,
+		Time:    t,
 		State:   s.Status(),
 		Info:    sql,
 	}
@@ -743,7 +922,7 @@ func (s *session) SetProcessInfo(sql string) {
 	s.processInfo.Store(pi)
 }
 
-func (s *session) executeStatement(ctx context.Context, connID uint64, stmtNode ast.StmtNode, stmt ast.Statement, recordSets []ast.RecordSet) ([]ast.RecordSet, error) {
+func (s *session) executeStatement(ctx context.Context, connID uint64, stmtNode ast.StmtNode, stmt sqlexec.Statement, recordSets []sqlexec.RecordSet) ([]sqlexec.RecordSet, error) {
 	s.SetValue(sessionctx.QueryString, stmt.OriginText())
 	if _, ok := stmtNode.(ast.DDLNode); ok {
 		s.SetValue(sessionctx.LastExecuteDDL, true)
@@ -755,12 +934,18 @@ func (s *session) executeStatement(ctx context.Context, connID uint64, stmtNode 
 	recordSet, err := runStmt(ctx, s, stmt)
 	if err != nil {
 		if !kv.ErrKeyExists.Equal(err) {
-			log.Warnf("[con:%d][schema ver:%d] session error:\n%v\n%s",
-				connID, s.sessionVars.TxnCtx.SchemaVersion, errors.ErrorStack(err), s)
+			logutil.Logger(ctx).Warn("run statement error",
+				zap.Int64("schemaVersion", s.sessionVars.TxnCtx.SchemaVersion),
+				zap.Error(err),
+				zap.String("session", s.String()))
 		}
-		return nil, errors.Trace(err)
+		return nil, err
 	}
-	metrics.SessionExecuteRunDuration.Observe(time.Since(startTime).Seconds())
+	if s.isInternal() {
+		sessionExecuteRunDurationInternal.Observe(time.Since(startTime).Seconds())
+	} else {
+		sessionExecuteRunDurationGeneral.Observe(time.Since(startTime).Seconds())
+	}
 
 	if recordSet != nil {
 		recordSets = append(recordSets, recordSet)
@@ -768,89 +953,84 @@ func (s *session) executeStatement(ctx context.Context, connID uint64, stmtNode 
 	return recordSets, nil
 }
 
-func (s *session) Execute(ctx context.Context, sql string) (recordSets []ast.RecordSet, err error) {
-	if span := opentracing.SpanFromContext(ctx); span != nil {
-		span, ctx = opentracing.StartSpanFromContext(ctx, "session.Execute")
-		defer span.Finish()
+func (s *session) Execute(ctx context.Context, sql string) (recordSets []sqlexec.RecordSet, err error) {
+	if span := opentracing.SpanFromContext(ctx); span != nil && span.Tracer() != nil {
+		span1 := span.Tracer().StartSpan("session.Execute", opentracing.ChildOf(span.Context()))
+		defer span1.Finish()
 	}
+	if recordSets, err = s.execute(ctx, sql); err != nil {
+		s.sessionVars.StmtCtx.AppendError(err)
+	}
+	return
+}
 
+func (s *session) execute(ctx context.Context, sql string) (recordSets []sqlexec.RecordSet, err error) {
 	s.PrepareTxnCtx(ctx)
-	var (
-		cacheKey         kvcache.Key
-		cacheValue       kvcache.Value
-		hitCache         = false
-		connID           = s.sessionVars.ConnectionID
-		planCacheEnabled = s.sessionVars.PlanCacheEnabled // Its value is read from the global configuration, and it will be only updated in tests.
-	)
-
-	if planCacheEnabled {
-		schemaVersion := domain.GetDomain(s).InfoSchema().SchemaMetaVersion()
-		readOnly := s.Txn() == nil || s.Txn().IsReadOnly()
-
-		cacheKey = plan.NewSQLCacheKey(s.sessionVars, sql, schemaVersion, readOnly)
-		cacheValue, hitCache = plan.GlobalPlanCache.Get(cacheKey)
+	connID := s.sessionVars.ConnectionID
+	err = s.loadCommonGlobalVariablesIfNeeded()
+	if err != nil {
+		return nil, err
 	}
 
-	if hitCache {
-		metrics.PlanCacheCounter.WithLabelValues("select").Inc()
-		stmtNode := cacheValue.(*plan.SQLCacheValue).StmtNode
-		stmt := &executor.ExecStmt{
-			InfoSchema: executor.GetInfoSchema(s),
-			Plan:       cacheValue.(*plan.SQLCacheValue).Plan,
-			Expensive:  cacheValue.(*plan.SQLCacheValue).Expensive,
-			Text:       stmtNode.Text(),
-			StmtNode:   stmtNode,
-			Ctx:        s,
-		}
+	charsetInfo, collation := s.sessionVars.GetCharsetInfo()
 
-		s.PrepareTxnCtx(ctx)
-		executor.ResetStmtCtx(s, stmtNode)
-		if recordSets, err = s.executeStatement(ctx, connID, stmtNode, stmt, recordSets); err != nil {
-			return nil, errors.Trace(err)
-		}
+	// Step1: Compile query string to abstract syntax trees(ASTs).
+	startTS := time.Now()
+	stmtNodes, warns, err := s.ParseSQL(ctx, sql, charsetInfo, collation)
+	if err != nil {
+		s.rollbackOnError(ctx)
+		logutil.Logger(ctx).Warn("parse sql error",
+			zap.Error(err),
+			zap.String("sql", sql))
+		return nil, util.SyntaxError(err)
+	}
+	isInternal := s.isInternal()
+	if isInternal {
+		sessionExecuteParseDurationInternal.Observe(time.Since(startTS).Seconds())
 	} else {
-		err = s.loadCommonGlobalVariablesIfNeeded()
-		if err != nil {
-			return nil, errors.Trace(err)
+		sessionExecuteParseDurationGeneral.Observe(time.Since(startTS).Seconds())
+	}
+
+	var tempStmtNodes []ast.StmtNode
+	compiler := executor.Compiler{Ctx: s}
+	for idx, stmtNode := range stmtNodes {
+		s.PrepareTxnCtx(ctx)
+
+		// Step2: Transform abstract syntax tree to a physical plan(stored in executor.ExecStmt).
+		startTS = time.Now()
+		// Some executions are done in compile stage, so we reset them before compile.
+		if err := executor.ResetContextOfStmt(s, stmtNode); err != nil {
+			return nil, err
 		}
-
-		charsetInfo, collation := s.sessionVars.GetCharsetInfo()
-
-		// Step1: Compile query string to abstract syntax trees(ASTs).
-		startTS := time.Now()
-		stmtNodes, err := s.ParseSQL(ctx, sql, charsetInfo, collation)
+		stmt, err := compiler.Compile(ctx, stmtNode)
 		if err != nil {
-			s.rollbackOnError(ctx)
-			log.Warnf("[con:%d] parse error:\n%v\n%s", connID, err, sql)
-			return nil, errors.Trace(err)
-		}
-		metrics.SessionExecuteParseDuration.Observe(time.Since(startTS).Seconds())
-
-		compiler := executor.Compiler{Ctx: s}
-		for _, stmtNode := range stmtNodes {
-			s.PrepareTxnCtx(ctx)
-
-			// Step2: Transform abstract syntax tree to a physical plan(stored in executor.ExecStmt).
-			startTS = time.Now()
-			// Some executions are done in compile stage, so we reset them before compile.
-			executor.ResetStmtCtx(s, stmtNode)
-			stmt, err := compiler.Compile(ctx, stmtNode)
+			if tempStmtNodes == nil {
+				tempStmtNodes, warns, err = s.ParseSQL(ctx, sql, charsetInfo, collation)
+				if err != nil || warns != nil {
+					//just skip errcheck, because parse will not return an error.
+				}
+			}
+			stmtNode = tempStmtNodes[idx]
+			stmt, err = compiler.SkipBindCompile(ctx, stmtNode)
 			if err != nil {
 				s.rollbackOnError(ctx)
-				log.Warnf("[con:%d] compile error:\n%v\n%s", connID, err, sql)
-				return nil, errors.Trace(err)
+				logutil.Logger(ctx).Warn("compile sql error",
+					zap.Error(err),
+					zap.String("sql", sql))
+				return nil, err
 			}
-			metrics.SessionExecuteCompileDuration.Observe(time.Since(startTS).Seconds())
+			s.handleInvalidBindRecord(ctx, stmtNode)
+		}
+		if isInternal {
+			sessionExecuteCompileDurationInternal.Observe(time.Since(startTS).Seconds())
+		} else {
+			sessionExecuteCompileDurationGeneral.Observe(time.Since(startTS).Seconds())
+		}
+		s.currentPlan = stmt.Plan
 
-			// Step3: Cache the physical plan if possible.
-			if planCacheEnabled && stmt.Cacheable && len(stmtNodes) == 1 && !s.GetSessionVars().StmtCtx.HistogramsNotLoad() {
-				plan.GlobalPlanCache.Put(cacheKey, plan.NewSQLCacheValue(stmtNode, stmt.Plan, stmt.Expensive))
-			}
-
-			// Step4: Execute the physical plan.
-			if recordSets, err = s.executeStatement(ctx, connID, stmtNode, stmt, recordSets); err != nil {
-				return nil, errors.Trace(err)
-			}
+		// Step3: Execute the physical plan.
+		if recordSets, err = s.executeStatement(ctx, connID, stmtNode, stmt, recordSets); err != nil {
+			return nil, err
 		}
 	}
 
@@ -858,13 +1038,70 @@ func (s *session) Execute(ctx context.Context, sql string) (recordSets []ast.Rec
 		// return the first recordset if client doesn't support ClientMultiResults.
 		recordSets = recordSets[:1]
 	}
+
+	for _, warn := range warns {
+		s.sessionVars.StmtCtx.AppendWarning(util.SyntaxWarn(warn))
+	}
 	return recordSets, nil
+}
+
+func (s *session) handleInvalidBindRecord(ctx context.Context, stmtNode ast.StmtNode) {
+	var normdOrigSQL string
+	switch x := stmtNode.(type) {
+	case *ast.ExplainStmt:
+		switch x.Stmt.(type) {
+		case *ast.SelectStmt:
+			normalizeExplainSQL := parser.Normalize(x.Text())
+			idx := strings.Index(normalizeExplainSQL, "select")
+			normdOrigSQL = normalizeExplainSQL[idx:]
+		default:
+			return
+		}
+	case *ast.SelectStmt:
+		normdOrigSQL = parser.Normalize(x.Text())
+	default:
+		return
+	}
+	sessionHandle := s.Value(bindinfo.SessionBindInfoKeyType).(*bindinfo.SessionHandle)
+	bindMeta := sessionHandle.GetBindRecord(normdOrigSQL, s.GetSessionVars().CurrentDB)
+	if bindMeta != nil {
+		bindMeta.Status = bindinfo.Invalid
+		return
+	}
+
+	globalHandle := domain.GetDomain(s).BindHandle()
+	bindMeta = globalHandle.GetBindRecord(normdOrigSQL, s.GetSessionVars().CurrentDB)
+	if bindMeta == nil {
+		bindMeta = globalHandle.GetBindRecord(normdOrigSQL, "")
+	}
+	if bindMeta != nil {
+		record := &bindinfo.BindRecord{
+			OriginalSQL: bindMeta.OriginalSQL,
+			BindSQL:     bindMeta.BindSQL,
+			Db:          s.GetSessionVars().CurrentDB,
+			Charset:     bindMeta.Charset,
+			Collation:   bindMeta.Collation,
+			Status:      bindinfo.Invalid,
+		}
+
+		err := sessionHandle.AddBindRecord(record)
+		if err != nil {
+			logutil.Logger(ctx).Warn("handleInvalidBindRecord failed", zap.Error(err))
+		}
+
+		globalHandle := domain.GetDomain(s).BindHandle()
+		dropBindRecord := &bindinfo.BindRecord{
+			OriginalSQL: bindMeta.OriginalSQL,
+			Db:          bindMeta.Db,
+		}
+		globalHandle.AddDropInvalidBindTask(dropBindRecord)
+	}
 }
 
 // rollbackOnError makes sure the next statement starts a new transaction with the latest InfoSchema.
 func (s *session) rollbackOnError(ctx context.Context) {
 	if !s.sessionVars.InTxn() {
-		terror.Log(s.RollbackTxn(ctx))
+		s.RollbackTxn(ctx)
 	}
 }
 
@@ -876,7 +1113,6 @@ func (s *session) PrepareStmt(sql string) (stmtID uint32, paramCount int, fields
 	}
 	err = s.loadCommonGlobalVariablesIfNeeded()
 	if err != nil {
-		err = errors.Trace(err)
 		return
 	}
 
@@ -888,16 +1124,11 @@ func (s *session) PrepareStmt(sql string) (stmtID uint32, paramCount int, fields
 	prepareExec := executor.NewPrepareExec(s, executor.GetInfoSchema(s), sql)
 	err = prepareExec.Next(ctx, nil)
 	if err != nil {
-		err = errors.Trace(err)
 		return
 	}
 	if !inTxn {
 		// We could start a transaction to build the prepare executor before, we should rollback it here.
-		err = s.RollbackTxn(ctx)
-		if err != nil {
-			err = errors.Trace(err)
-			return
-		}
+		s.RollbackTxn(ctx)
 	}
 	return prepareExec.ID, prepareExec.ParamCount, prepareExec.Fields, nil
 }
@@ -949,58 +1180,79 @@ func checkArgs(args ...interface{}) error {
 }
 
 // ExecutePreparedStmt executes a prepared statement.
-func (s *session) ExecutePreparedStmt(ctx context.Context, stmtID uint32, args ...interface{}) (ast.RecordSet, error) {
+func (s *session) ExecutePreparedStmt(ctx context.Context, stmtID uint32, args ...interface{}) (sqlexec.RecordSet, error) {
 	err := checkArgs(args...)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 
 	s.PrepareTxnCtx(ctx)
 	st, err := executor.CompileExecutePreparedStmt(s, stmtID, args...)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 	logQuery(st.OriginText(), s.sessionVars)
 	r, err := runStmt(ctx, s, st)
-	return r, errors.Trace(err)
+	return r, err
 }
 
 func (s *session) DropPreparedStmt(stmtID uint32) error {
 	vars := s.sessionVars
 	if _, ok := vars.PreparedStmts[stmtID]; !ok {
-		return plan.ErrStmtNotFound
+		return plannercore.ErrStmtNotFound
 	}
 	vars.RetryInfo.DroppedPreparedStmtIDs = append(vars.RetryInfo.DroppedPreparedStmtIDs, stmtID)
 	return nil
 }
 
-func (s *session) Txn() kv.Transaction {
-	if !s.txn.Valid() {
-		return nil
+func (s *session) Txn(active bool) (kv.Transaction, error) {
+	if s.txn.pending() && active {
+		// Transaction is lazy initialized.
+		// PrepareTxnCtx is called to get a tso future, makes s.txn a pending txn,
+		// If Txn() is called later, wait for the future to get a valid txn.
+		txnCap := s.getMembufCap()
+		if err := s.txn.changePendingToValid(txnCap); err != nil {
+			logutil.Logger(context.Background()).Error("active transaction fail",
+				zap.Error(err))
+			s.txn.cleanup()
+			s.sessionVars.TxnCtx.StartTS = 0
+			return &s.txn, err
+		}
+		s.sessionVars.TxnCtx.StartTS = s.txn.StartTS()
+		if !s.sessionVars.IsAutocommit() {
+			s.sessionVars.SetStatusFlag(mysql.ServerStatusInTrans, true)
+		}
 	}
-	return &s.txn
+	return &s.txn, nil
 }
 
-func (s *session) NewTxn() error {
+func (s *session) NewTxn(ctx context.Context) error {
 	if s.txn.Valid() {
 		txnID := s.txn.StartTS()
-		ctx := context.TODO()
 		err := s.CommitTxn(ctx)
 		if err != nil {
-			return errors.Trace(err)
+			return err
 		}
 		vars := s.GetSessionVars()
-		log.Infof("[con:%d][schema ver:%d] NewTxn() inside a transaction auto commit: %d", vars.ConnectionID, vars.TxnCtx.SchemaVersion, txnID)
+		logutil.Logger(ctx).Info("NewTxn() inside a transaction auto commit",
+			zap.Int64("schemaVersion", vars.TxnCtx.SchemaVersion),
+			zap.Uint64("txnStartTS", txnID))
 	}
 
 	txn, err := s.store.Begin()
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
 	txn.SetCap(s.getMembufCap())
 	txn.SetVars(s.sessionVars.KVVars)
 	s.txn.changeInvalidToValid(txn)
-	s.sessionVars.TxnCtx.StartTS = txn.StartTS()
+	is := domain.GetDomain(s).InfoSchema()
+	s.sessionVars.TxnCtx = &variable.TransactionContext{
+		InfoSchema:    is,
+		SchemaVersion: is.SchemaMetaVersion(),
+		CreateTime:    time.Now(),
+		StartTS:       txn.StartTS(),
+	}
 	return nil
 }
 
@@ -1029,8 +1281,9 @@ func (s *session) Close() {
 		s.statsCollector.Delete()
 	}
 	ctx := context.TODO()
-	if err := s.RollbackTxn(ctx); err != nil {
-		log.Error("session Close error:", errors.ErrorStack(err))
+	s.RollbackTxn(ctx)
+	if s.sessionVars != nil {
+		s.sessionVars.WithdrawAllPreparedStmt()
 	}
 }
 
@@ -1042,30 +1295,42 @@ func (s *session) GetSessionVars() *variable.SessionVars {
 func (s *session) Auth(user *auth.UserIdentity, authentication []byte, salt []byte) bool {
 	pm := privilege.GetPrivilegeManager(s)
 
-	// Check IP.
-	if pm.ConnectionVerification(user.Username, user.Hostname, authentication, salt) {
+	// Check IP or localhost.
+	var success bool
+	user.AuthUsername, user.AuthHostname, success = pm.ConnectionVerification(user.Username, user.Hostname, authentication, salt)
+	if success {
 		s.sessionVars.User = user
+		s.sessionVars.ActiveRoles = pm.GetDefaultRoles(user.AuthUsername, user.AuthHostname)
 		return true
+	} else if user.Hostname == variable.DefHostname {
+		logutil.Logger(context.Background()).Error("user connection verification failed",
+			zap.Stringer("user", user))
+		return false
 	}
 
 	// Check Hostname.
 	for _, addr := range getHostByIP(user.Hostname) {
-		if pm.ConnectionVerification(user.Username, addr, authentication, salt) {
+		u, h, success := pm.ConnectionVerification(user.Username, addr, authentication, salt)
+		if success {
 			s.sessionVars.User = &auth.UserIdentity{
-				Username: user.Username,
-				Hostname: addr,
+				Username:     user.Username,
+				Hostname:     addr,
+				AuthUsername: u,
+				AuthHostname: h,
 			}
+			s.sessionVars.ActiveRoles = pm.GetDefaultRoles(u, h)
 			return true
 		}
 	}
 
-	log.Errorf("User connection verification failed %s", user)
+	logutil.Logger(context.Background()).Error("user connection verification failed",
+		zap.Stringer("user", user))
 	return false
 }
 
 func getHostByIP(ip string) []string {
 	if ip == "127.0.0.1" {
-		return []string{"localhost"}
+		return []string{variable.DefHostname}
 	}
 	addrs, err := net.LookupAddr(ip)
 	terror.Log(errors.Trace(err))
@@ -1084,38 +1349,77 @@ func CreateSession4Test(store kv.Storage) (Session, error) {
 	s, err := CreateSession(store)
 	if err == nil {
 		// initialize session variables for test.
-		s.GetSessionVars().MaxChunkSize = 2
+		s.GetSessionVars().InitChunkSize = 2
+		s.GetSessionVars().MaxChunkSize = 32
 	}
-	return s, errors.Trace(err)
+	return s, err
 }
 
 // CreateSession creates a new session environment.
 func CreateSession(store kv.Storage) (Session, error) {
 	s, err := createSession(store)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 
 	// Add auth here.
 	do, err := domap.Get(store)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 	pm := &privileges.UserPrivileges{
 		Handle: do.PrivilegeHandle(),
 	}
 	privilege.BindPrivilegeManager(s, pm)
 
-	// Add statsUpdateHandle.
-	if do.StatsHandle() != nil {
+	sessionBindHandle := bindinfo.NewSessionBindHandle(s.parser)
+	s.SetValue(bindinfo.SessionBindInfoKeyType, sessionBindHandle)
+	// Add stats collector, and it will be freed by background stats worker
+	// which periodically updates stats using the collected data.
+	if do.StatsHandle() != nil && do.StatsUpdating() {
 		s.statsCollector = do.StatsHandle().NewSessionStatsCollector()
 	}
 
 	return s, nil
 }
 
+// loadSystemTZ loads systemTZ from mysql.tidb
+func loadSystemTZ(se *session) (string, error) {
+	sql := `select variable_value from mysql.tidb where variable_name = 'system_tz'`
+	rss, errLoad := se.Execute(context.Background(), sql)
+	if errLoad != nil {
+		return "", errLoad
+	}
+	// the record of mysql.tidb under where condition: variable_name = "system_tz" should shall only be one.
+	defer func() {
+		if err := rss[0].Close(); err != nil {
+			logutil.Logger(context.Background()).Error("close result set error", zap.Error(err))
+		}
+	}()
+	req := rss[0].NewRecordBatch()
+	if err := rss[0].Next(context.Background(), req); err != nil {
+		return "", err
+	}
+	return req.GetRow(0).GetString(0), nil
+}
+
 // BootstrapSession runs the first time when the TiDB server start.
 func BootstrapSession(store kv.Storage) (*domain.Domain, error) {
+	cfg := config.GetGlobalConfig()
+	if len(cfg.Plugin.Load) > 0 {
+		err := plugin.Load(context.Background(), plugin.Config{
+			Plugins:        strings.Split(cfg.Plugin.Load, ","),
+			PluginDir:      cfg.Plugin.Dir,
+			GlobalSysVar:   &variable.SysVars,
+			PluginVarNames: &variable.PluginVarNames,
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	initLoadCommonGlobalVarsSQL()
+
 	ver := getStoreBootstrapVersion(store)
 	if ver == notBootstrapped {
 		runInBootstrapSession(store, bootstrap)
@@ -1125,30 +1429,56 @@ func BootstrapSession(store kv.Storage) (*domain.Domain, error) {
 
 	se, err := createSession(store)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
-	dom := domain.GetDomain(se)
-	err = dom.LoadPrivilegeLoop(se)
+	// get system tz from mysql.tidb
+	tz, err := loadSystemTZ(se)
 	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	se1, err := createSession(store)
-	if err != nil {
-		return nil, errors.Trace(err)
-	}
-	err = dom.UpdateTableStatsLoop(se1)
-	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 
-	if raw, ok := store.(domain.EtcdBackend); ok {
-		err = raw.StartGCWorker()
+	timeutil.SetSystemTZ(tz)
+	dom := domain.GetDomain(se)
+
+	if !config.GetGlobalConfig().Security.SkipGrantTable {
+		err = dom.LoadPrivilegeLoop(se)
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, err
 		}
 	}
 
-	return dom, errors.Trace(err)
+	if len(cfg.Plugin.Load) > 0 {
+		err := plugin.Init(context.Background(), plugin.Config{EtcdClient: dom.GetEtcdClient()})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	se1, err := createSession(store)
+	if err != nil {
+		return nil, err
+	}
+	err = dom.UpdateTableStatsLoop(se1)
+	if err != nil {
+		return nil, err
+	}
+	se2, err := createSession(store)
+	if err != nil {
+		return nil, err
+	}
+	err = dom.LoadBindInfoLoop(se2)
+	if err != nil {
+		return nil, err
+	}
+
+	if raw, ok := store.(tikv.EtcdBackend); ok {
+		err = raw.StartGCWorker()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return dom, err
 }
 
 // GetDomain gets the associated domain for store.
@@ -1159,14 +1489,14 @@ func GetDomain(store kv.Storage) (*domain.Domain, error) {
 // runInBootstrapSession create a special session for boostrap to run.
 // If no bootstrap and storage is remote, we must use a little lease time to
 // bootstrap quickly, after bootstrapped, we will reset the lease time.
-// TODO: Using a bootstap tool for doing this may be better later.
+// TODO: Using a bootstrap tool for doing this may be better later.
 func runInBootstrapSession(store kv.Storage, bootstrap func(Session)) {
 	saveLease := schemaLease
 	schemaLease = chooseMinLease(schemaLease, 100*time.Millisecond)
 	s, err := createSession(store)
 	if err != nil {
 		// Bootstrap fail will cause program exit.
-		log.Fatal(errors.ErrorStack(err))
+		logutil.Logger(context.Background()).Fatal("createSession error", zap.Error(err))
 	}
 	schemaLease = saveLease
 
@@ -1183,7 +1513,7 @@ func runInBootstrapSession(store kv.Storage, bootstrap func(Session)) {
 func createSession(store kv.Storage) (*session, error) {
 	dom, err := domap.Get(store)
 	if err != nil {
-		return nil, errors.Trace(err)
+		return nil, err
 	}
 	s := &session{
 		store:           store,
@@ -1191,14 +1521,15 @@ func createSession(store kv.Storage) (*session, error) {
 		sessionVars:     variable.NewSessionVars(),
 		ddlOwnerChecker: dom.DDL().OwnerManager(),
 	}
-	if plan.PreparedPlanCacheEnabled {
-		s.preparedPlanCache = kvcache.NewSimpleLRUCache(plan.PreparedPlanCacheCapacity)
+	if plannercore.PreparedPlanCacheEnabled() {
+		s.preparedPlanCache = kvcache.NewSimpleLRUCache(plannercore.PreparedPlanCacheCapacity,
+			plannercore.PreparedPlanCacheMemoryGuardRatio, plannercore.PreparedPlanCacheMaxMemory.Load())
 	}
 	s.mu.values = make(map[fmt.Stringer]interface{})
 	domain.BindDomain(s, dom)
 	// session implements variable.GlobalVarAccessor. Bind it to ctx.
 	s.sessionVars.GlobalVarsAccessor = s
-	s.sessionVars.BinlogClient = binloginfo.GetPumpClient()
+	s.sessionVars.BinlogClient = binloginfo.GetPumpsClient()
 	s.txn.init()
 	return s, nil
 }
@@ -1213,8 +1544,9 @@ func createSessionWithDomain(store kv.Storage, dom *domain.Domain) (*session, er
 		parser:      parser.New(),
 		sessionVars: variable.NewSessionVars(),
 	}
-	if plan.PreparedPlanCacheEnabled {
-		s.preparedPlanCache = kvcache.NewSimpleLRUCache(plan.PreparedPlanCacheCapacity)
+	if plannercore.PreparedPlanCacheEnabled() {
+		s.preparedPlanCache = kvcache.NewSimpleLRUCache(plannercore.PreparedPlanCacheCapacity,
+			plannercore.PreparedPlanCacheMemoryGuardRatio, plannercore.PreparedPlanCacheMaxMemory.Load())
 	}
 	s.mu.values = make(map[fmt.Stringer]interface{})
 	domain.BindDomain(s, dom)
@@ -1226,7 +1558,7 @@ func createSessionWithDomain(store kv.Storage, dom *domain.Domain) (*session, er
 
 const (
 	notBootstrapped         = 0
-	currentBootstrapVersion = 21
+	currentBootstrapVersion = 30
 )
 
 func getStoreBootstrapVersion(store kv.Storage) int64 {
@@ -1244,11 +1576,12 @@ func getStoreBootstrapVersion(store kv.Storage) int64 {
 		var err error
 		t := meta.NewMeta(txn)
 		ver, err = t.GetBootstrapVersion()
-		return errors.Trace(err)
+		return err
 	})
 
 	if err != nil {
-		log.Fatalf("check bootstrapped err %v", err)
+		logutil.Logger(context.Background()).Fatal("check bootstrapped failed",
+			zap.Error(err))
 	}
 
 	if ver > notBootstrapped {
@@ -1267,66 +1600,72 @@ func finishBootstrap(store kv.Storage) {
 	err := kv.RunInNewTxn(store, true, func(txn kv.Transaction) error {
 		t := meta.NewMeta(txn)
 		err := t.FinishBootstrap(currentBootstrapVersion)
-		return errors.Trace(err)
+		return err
 	})
 	if err != nil {
-		log.Fatalf("finish bootstrap err %v", err)
+		logutil.Logger(context.Background()).Fatal("finish bootstrap failed",
+			zap.Error(err))
 	}
 }
 
 const quoteCommaQuote = "', '"
-const loadCommonGlobalVarsSQL = "select HIGH_PRIORITY * from mysql.global_variables where variable_name in ('" +
-	variable.AutocommitVar + quoteCommaQuote +
-	variable.SQLModeVar + quoteCommaQuote +
-	variable.MaxAllowedPacket + quoteCommaQuote +
-	variable.TimeZone + quoteCommaQuote +
+
+var builtinGlobalVariable = []string{
+	variable.AutocommitVar,
+	variable.SQLModeVar,
+	variable.MaxAllowedPacket,
+	variable.TimeZone,
+	variable.BlockEncryptionMode,
+	variable.WaitTimeout,
+	variable.InteractiveTimeout,
+	variable.MaxPreparedStmtCount,
 	/* TiDB specific global variables: */
-	variable.TiDBSkipUTF8Check + quoteCommaQuote +
-	variable.TiDBIndexJoinBatchSize + quoteCommaQuote +
-	variable.TiDBIndexLookupSize + quoteCommaQuote +
-	variable.TiDBIndexLookupConcurrency + quoteCommaQuote +
-	variable.TiDBIndexLookupJoinConcurrency + quoteCommaQuote +
-	variable.TiDBIndexSerialScanConcurrency + quoteCommaQuote +
-	variable.TiDBHashJoinConcurrency + quoteCommaQuote +
-	variable.TiDBProjectionConcurrency + quoteCommaQuote +
-	variable.TiDBBackoffLockFast + quoteCommaQuote +
-	variable.TiDBOptInSubqUnFolding + quoteCommaQuote +
-	variable.TiDBDistSQLScanConcurrency + quoteCommaQuote +
-	variable.TiDBMaxChunkSize + quoteCommaQuote +
-	variable.TiDBRetryLimit + "')"
-
-type globalVariableCache struct {
-	sync.RWMutex
-	lastModify time.Time
-	rows       []types.Row
-	fields     []*ast.ResultField
+	variable.TiDBSkipUTF8Check,
+	variable.TiDBIndexJoinBatchSize,
+	variable.TiDBIndexLookupSize,
+	variable.TiDBIndexLookupConcurrency,
+	variable.TiDBIndexLookupJoinConcurrency,
+	variable.TiDBIndexSerialScanConcurrency,
+	variable.TiDBHashJoinConcurrency,
+	variable.TiDBProjectionConcurrency,
+	variable.TiDBHashAggPartialConcurrency,
+	variable.TiDBHashAggFinalConcurrency,
+	variable.TiDBBackoffLockFast,
+	variable.TiDBConstraintCheckInPlace,
+	variable.TiDBDDLReorgWorkerCount,
+	variable.TiDBDDLReorgBatchSize,
+	variable.TiDBDDLErrorCountLimit,
+	variable.TiDBOptInSubqToJoinAndAgg,
+	variable.TiDBOptCorrelationThreshold,
+	variable.TiDBOptCorrelationExpFactor,
+	variable.TiDBDistSQLScanConcurrency,
+	variable.TiDBInitChunkSize,
+	variable.TiDBMaxChunkSize,
+	variable.TiDBEnableCascadesPlanner,
+	variable.TiDBRetryLimit,
+	variable.TiDBDisableTxnAutoRetry,
+	variable.TiDBEnableWindowFunction,
+	variable.TiDBEnableFastAnalyze,
 }
 
-var gvc globalVariableCache
+var (
+	loadCommonGlobalVarsSQLOnce sync.Once
+	loadCommonGlobalVarsSQL     string
+)
 
-const globalVariableCacheExpiry time.Duration = 2 * time.Second
-
-func (gvc *globalVariableCache) Update(rows []types.Row, fields []*ast.ResultField) {
-	gvc.Lock()
-	gvc.lastModify = time.Now()
-	gvc.rows = rows
-	gvc.fields = fields
-	gvc.Unlock()
-}
-
-func (gvc *globalVariableCache) Get() (succ bool, rows []types.Row, fields []*ast.ResultField) {
-	gvc.RLock()
-	defer gvc.RUnlock()
-	if time.Now().Sub(gvc.lastModify) < globalVariableCacheExpiry {
-		succ, rows, fields = true, gvc.rows, gvc.fields
-		return
-	}
-	succ = false
-	return
+func initLoadCommonGlobalVarsSQL() {
+	loadCommonGlobalVarsSQLOnce.Do(func() {
+		vars := append(make([]string, 0, len(builtinGlobalVariable)+len(variable.PluginVarNames)), builtinGlobalVariable...)
+		if len(variable.PluginVarNames) > 0 {
+			vars = append(vars, variable.PluginVarNames...)
+		}
+		loadCommonGlobalVarsSQL = "select HIGH_PRIORITY * from mysql.global_variables where variable_name in ('" + strings.Join(vars, quoteCommaQuote) + "')"
+	})
 }
 
 // loadCommonGlobalVariablesIfNeeded loads and applies commonly used global variables for the session.
 func (s *session) loadCommonGlobalVariablesIfNeeded() error {
+	initLoadCommonGlobalVarsSQL()
 	vars := s.sessionVars
 	if vars.CommonGlobalLoaded {
 		return nil
@@ -1337,8 +1676,9 @@ func (s *session) loadCommonGlobalVariablesIfNeeded() error {
 	}
 
 	var err error
-	// Use globalVariableCache if TiDB just loaded global variables within 2 second ago.
+	// Use GlobalVariableCache if TiDB just loaded global variables within 2 second ago.
 	// When a lot of connections connect to TiDB simultaneously, it can protect TiKV meta region from overload.
+	gvc := domain.GetDomain(s).GetGlobalVarsCache()
 	succ, rows, fields := gvc.Get()
 	if !succ {
 		// Set the variable to true to prevent cyclic recursive call.
@@ -1346,8 +1686,8 @@ func (s *session) loadCommonGlobalVariablesIfNeeded() error {
 		rows, fields, err = s.ExecRestrictedSQL(s, loadCommonGlobalVarsSQL)
 		if err != nil {
 			vars.CommonGlobalLoaded = false
-			log.Errorf("Failed to load common global variables.")
-			return errors.Trace(err)
+			logutil.Logger(context.Background()).Error("failed to load common global variables.")
+			return err
 		}
 		gvc.Update(rows, fields)
 	}
@@ -1358,10 +1698,20 @@ func (s *session) loadCommonGlobalVariablesIfNeeded() error {
 		if _, ok := vars.GetSystemVar(varName); !ok {
 			err = variable.SetSessionSystemVar(s.sessionVars, varName, varVal)
 			if err != nil {
-				return errors.Trace(err)
+				return err
 			}
 		}
 	}
+
+	// when client set Capability Flags CLIENT_INTERACTIVE, init wait_timeout with interactive_timeout
+	if vars.ClientCapability&mysql.ClientInteractive > 0 {
+		if varVal, ok := vars.GetSystemVar(variable.InteractiveTimeout); ok {
+			if err := vars.SetSystemVar(variable.WaitTimeout, varVal); err != nil {
+				return err
+			}
+		}
+	}
+
 	vars.CommonGlobalLoaded = true
 	return nil
 }
@@ -1381,36 +1731,15 @@ func (s *session) PrepareTxnCtx(ctx context.Context) {
 		SchemaVersion: is.SchemaMetaVersion(),
 		CreateTime:    time.Now(),
 	}
-	if !s.sessionVars.IsAutocommit() {
-		s.sessionVars.SetStatusFlag(mysql.ServerStatusInTrans, true)
-	}
 }
 
 // RefreshTxnCtx implements context.RefreshTxnCtx interface.
 func (s *session) RefreshTxnCtx(ctx context.Context) error {
 	if err := s.doCommit(ctx); err != nil {
-		return errors.Trace(err)
+		return err
 	}
 
-	return errors.Trace(s.NewTxn())
-}
-
-// ActivePendingTxn implements Context.ActivePendingTxn interface.
-func (s *session) ActivePendingTxn() error {
-	if s.txn.Valid() {
-		return nil
-	}
-	txnCap := s.getMembufCap()
-	// The transaction status should be pending.
-	if err := s.txn.changePendingToValid(txnCap); err != nil {
-		return errors.Trace(err)
-	}
-	s.sessionVars.TxnCtx.StartTS = s.txn.StartTS()
-	isoLevel, _ := s.sessionVars.GetSystemVar(variable.TxnIsolation)
-	if isoLevel == ast.ReadCommitted {
-		s.txn.SetOption(kv.IsolationLevel, kv.RC)
-	}
-	return nil
+	return s.NewTxn(ctx)
 }
 
 // InitTxnWithStartTS create a transaction with startTS.
@@ -1422,13 +1751,13 @@ func (s *session) InitTxnWithStartTS(startTS uint64) error {
 	// no need to get txn from txnFutureCh since txn should init with startTs
 	txn, err := s.store.BeginWithStartTS(startTS)
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
 	s.txn.changeInvalidToValid(txn)
 	s.txn.SetCap(s.getMembufCap())
 	err = s.loadCommonGlobalVariablesIfNeeded()
 	if err != nil {
-		return errors.Trace(err)
+		return err
 	}
 	return nil
 }
@@ -1443,7 +1772,6 @@ func (s *session) ShowProcess() util.ProcessInfo {
 	tmp := s.processInfo.Load()
 	if tmp != nil {
 		pi = tmp.(util.ProcessInfo)
-		pi.Mem = s.GetSessionVars().StmtCtx.MemTracker.BytesConsumed()
 	}
 	return pi
 }
@@ -1458,9 +1786,18 @@ func logStmt(node ast.StmtNode, vars *variable.SessionVars) {
 		user := vars.User
 		schemaVersion := vars.TxnCtx.SchemaVersion
 		if ss, ok := node.(ast.SensitiveStmtNode); ok {
-			log.Infof("[CRUCIAL OPERATION] [con:%d][schema ver:%d] %s (by %s).", vars.ConnectionID, schemaVersion, ss.SecureText(), user)
+			logutil.Logger(context.Background()).Info("CRUCIAL OPERATION",
+				zap.Uint64("conn", vars.ConnectionID),
+				zap.Int64("schemaVersion", schemaVersion),
+				zap.String("secure text", ss.SecureText()),
+				zap.Stringer("user", user))
 		} else {
-			log.Infof("[CRUCIAL OPERATION] [con:%d][schema ver:%d] %s (by %s).", vars.ConnectionID, schemaVersion, stmt.Text(), user)
+			logutil.Logger(context.Background()).Info("CRUCIAL OPERATION",
+				zap.Uint64("conn", vars.ConnectionID),
+				zap.Int64("schemaVersion", schemaVersion),
+				zap.String("cur_db", vars.CurrentDB),
+				zap.String("sql", stmt.Text()),
+				zap.Stringer("user", user))
 		}
 	default:
 		logQuery(node.Text(), vars)
@@ -1469,6 +1806,49 @@ func logStmt(node ast.StmtNode, vars *variable.SessionVars) {
 
 func logQuery(query string, vars *variable.SessionVars) {
 	if atomic.LoadUint32(&variable.ProcessGeneralLog) != 0 && !vars.InRestrictedSQL {
-		log.Infof("[con:%d][schema ver:%d][txn:%d] %s", vars.ConnectionID, vars.TxnCtx.SchemaVersion, vars.TxnCtx.StartTS, query)
+		query = executor.QueryReplacer.Replace(query)
+		logutil.Logger(context.Background()).Info("GENERAL_LOG",
+			zap.Uint64("conn", vars.ConnectionID),
+			zap.Stringer("user", vars.User),
+			zap.Int64("schemaVersion", vars.TxnCtx.SchemaVersion),
+			zap.Uint64("txnStartTS", vars.TxnCtx.StartTS),
+			zap.String("current_db", vars.CurrentDB),
+			zap.String("sql", query+vars.GetExecuteArgumentsInfo()))
+	}
+}
+
+func (s *session) recordOnTransactionExecution(err error, counter int, duration float64) {
+	if s.isInternal() {
+		if err != nil {
+			statementPerTransactionInternalError.Observe(float64(counter))
+			transactionDurationInternalError.Observe(duration)
+		} else {
+			statementPerTransactionInternalOK.Observe(float64(counter))
+			transactionDurationInternalOK.Observe(duration)
+		}
+	} else {
+		if err != nil {
+			statementPerTransactionGeneralError.Observe(float64(counter))
+			transactionDurationGeneralError.Observe(duration)
+		} else {
+			statementPerTransactionGeneralOK.Observe(float64(counter))
+			transactionDurationGeneralOK.Observe(duration)
+		}
+	}
+}
+
+func (s *session) recordTransactionCounter(err error) {
+	if s.isInternal() {
+		if err != nil {
+			transactionCounterInternalErr.Inc()
+		} else {
+			transactionCounterInternalOK.Inc()
+		}
+	} else {
+		if err != nil {
+			transactionCounterGeneralErr.Inc()
+		} else {
+			transactionCounterGeneralOK.Inc()
+		}
 	}
 }

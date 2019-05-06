@@ -21,8 +21,9 @@ import (
 	"sort"
 
 	"github.com/google/btree"
-	"github.com/juju/errors"
+	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
+	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/codec"
 )
 
@@ -255,7 +256,7 @@ func (e *mvccEntry) Get(ts uint64, isoLevel kvrpcpb.IsolationLevel) ([]byte, err
 func (e *mvccEntry) Prewrite(mutation *kvrpcpb.Mutation, startTS uint64, primary []byte, ttl uint64) error {
 	if len(e.values) > 0 {
 		if e.values[0].commitTS >= startTS {
-			return ErrRetryable("write conflict")
+			return ErrRetryable(util.WriteConflictMarker)
 		}
 	}
 	if e.lock != nil {
@@ -437,9 +438,13 @@ type MVCCStore interface {
 // RawKV is a key-value storage. MVCCStore can be implemented upon it with timestamp encoded into key.
 type RawKV interface {
 	RawGet(key []byte) []byte
-	RawScan(startKey, endKey []byte, limit int) []Pair
+	RawBatchGet(keys [][]byte) [][]byte
+	RawScan(startKey, endKey []byte, limit int) []Pair        // Scan the range of [startKey, endKey)
+	RawReverseScan(startKey, endKey []byte, limit int) []Pair // Scan the range of [endKey, startKey)
 	RawPut(key, value []byte)
+	RawBatchPut(keys, values [][]byte)
 	RawDelete(key []byte)
+	RawBatchDelete(keys [][]byte)
 	RawDeleteRange(startKey, endKey []byte)
 }
 

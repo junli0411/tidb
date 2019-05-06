@@ -14,14 +14,16 @@
 package oracles
 
 import (
+	"context"
 	"sync/atomic"
 	"time"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/pd/pd-client"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/pd/client"
+	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/store/tikv/oracle"
-	log "github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
+	"github.com/pingcap/tidb/util/logutil"
+	"go.uber.org/zap"
 )
 
 var _ oracle.Oracle = &pdOracle{}
@@ -36,7 +38,7 @@ type pdOracle struct {
 }
 
 // NewPdOracle create an Oracle that uses a pd client source.
-// Refer https://github.com/pingcap/pd/blob/master/pd-client/client.go for more details.
+// Refer https://github.com/pingcap/pd/blob/master/client/client.go for more details.
 // PdOracle mantains `lastTS` to store the last timestamp got from PD server. If
 // `GetTimestamp()` is not called after `updateInterval`, it will be called by
 // itself to keep up with the timestamp on PD server.
@@ -82,7 +84,7 @@ type tsFuture struct {
 func (f *tsFuture) Wait() (uint64, error) {
 	now := time.Now()
 	physical, logical, err := f.TSFuture.Wait()
-	tsFutureWaitDuration.Observe(time.Since(now).Seconds())
+	metrics.TSFutureWaitDuration.Observe(time.Since(now).Seconds())
 	if err != nil {
 		return 0, errors.Trace(err)
 	}
@@ -104,7 +106,8 @@ func (o *pdOracle) getTimestamp(ctx context.Context) (uint64, error) {
 	}
 	dist := time.Since(now)
 	if dist > slowDist {
-		log.Warnf("get timestamp too slow: %s", dist)
+		logutil.Logger(ctx).Warn("get timestamp too slow",
+			zap.Duration("cost time", dist))
 	}
 	return oracle.ComposeTS(physical, logical), nil
 }
@@ -123,7 +126,7 @@ func (o *pdOracle) updateTS(ctx context.Context, interval time.Duration) {
 		case <-ticker.C:
 			ts, err := o.getTimestamp(ctx)
 			if err != nil {
-				log.Errorf("updateTS error: %v", err)
+				logutil.Logger(ctx).Error("updateTS error", zap.Error(err))
 				break
 			}
 			o.setLastTS(ts)

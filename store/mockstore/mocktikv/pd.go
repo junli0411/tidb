@@ -14,12 +14,14 @@
 package mocktikv
 
 import (
+	"context"
 	"sync"
 	"time"
 
+	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/metapb"
-	"github.com/pingcap/pd/pd-client"
-	"golang.org/x/net/context"
+	"github.com/pingcap/kvproto/pkg/pdpb"
+	"github.com/pingcap/pd/client"
 )
 
 // Use global variables to prevent pdClients from creating duplicate timestamps.
@@ -77,6 +79,11 @@ func (c *pdClient) GetRegion(ctx context.Context, key []byte) (*metapb.Region, *
 	return region, peer, nil
 }
 
+func (c *pdClient) GetPrevRegion(ctx context.Context, key []byte) (*metapb.Region, *metapb.Peer, error) {
+	region, peer := c.cluster.GetPrevRegionByKey(key)
+	return region, peer, nil
+}
+
 func (c *pdClient) GetRegionByID(ctx context.Context, regionID uint64) (*metapb.Region, *metapb.Peer, error) {
 	region, peer := c.cluster.GetRegionByID(regionID)
 	return region, peer, nil
@@ -92,5 +99,21 @@ func (c *pdClient) GetStore(ctx context.Context, storeID uint64) (*metapb.Store,
 	return store, nil
 }
 
+func (c *pdClient) GetAllStores(ctx context.Context, opts ...pd.GetStoreOption) ([]*metapb.Store, error) {
+	panic(errors.New("unimplemented"))
+}
+
+func (c *pdClient) UpdateGCSafePoint(ctx context.Context, safePoint uint64) (uint64, error) {
+	panic("unimplemented")
+}
+
 func (c *pdClient) Close() {
+}
+
+func (c *pdClient) ScatterRegion(ctx context.Context, regionID uint64) error {
+	return nil
+}
+
+func (c *pdClient) GetOperator(ctx context.Context, regionID uint64) (*pdpb.GetOperatorResponse, error) {
+	return &pdpb.GetOperatorResponse{Status: pdpb.OperatorStatus_SUCCESS}, nil
 }

@@ -15,13 +15,15 @@ package printer
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/config"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/util/israce"
-	log "github.com/sirupsen/logrus"
+	"github.com/pingcap/tidb/util/logutil"
+	"go.uber.org/zap"
 )
 
 // Version information.
@@ -31,24 +33,25 @@ var (
 	TiDBGitBranch = "None"
 	GoVersion     = "None"
 	// TiKVMinVersion is the minimum version of TiKV that can be compatible with the current TiDB.
-	TiKVMinVersion = "2.1.0-alpha.1-2f291dc12b0e05d71eb8873881c3ed11d343d6e6"
+	TiKVMinVersion = "2.1.0-alpha.1-ff3dd160846b7d1aed9079c389fc188f7f5ea13e"
 )
 
 // PrintTiDBInfo prints the TiDB version information.
 func PrintTiDBInfo() {
-	log.Infof("Welcome to TiDB.")
-	log.Infof("Release Version: %s", mysql.TiDBReleaseVersion)
-	log.Infof("Git Commit Hash: %s", TiDBGitHash)
-	log.Infof("Git Branch: %s", TiDBGitBranch)
-	log.Infof("UTC Build Time:  %s", TiDBBuildTS)
-	log.Infof("GoVersion:  %s", GoVersion)
-	log.Infof("Race Enabled: %v", israce.RaceEnabled)
-	log.Infof("TiKV Min Version: %s", TiKVMinVersion)
+	logutil.Logger(context.Background()).Info("Welcome to TiDB.",
+		zap.String("Release Version", mysql.TiDBReleaseVersion),
+		zap.String("Git Commit Hash", TiDBGitHash),
+		zap.String("Git Branch", TiDBGitBranch),
+		zap.String("UTC Build Time", TiDBBuildTS),
+		zap.String("GoVersion", GoVersion),
+		zap.Bool("Race Enabled", israce.RaceEnabled),
+		zap.Bool("Check Table Before Drop", config.CheckTableBeforeDrop),
+		zap.String("TiKV Min Version", TiKVMinVersion))
 	configJSON, err := json.Marshal(config.GetGlobalConfig())
 	if err != nil {
 		panic(err)
 	}
-	log.Infof("Config: %s", configJSON)
+	logutil.Logger(context.Background()).Info("loaded config", zap.ByteString("config", configJSON))
 }
 
 // GetTiDBInfo returns the git hash and build time of this tidb-server binary.
@@ -59,14 +62,16 @@ func GetTiDBInfo() string {
 		"UTC Build Time: %s\n"+
 		"GoVersion: %s\n"+
 		"Race Enabled: %v\n"+
-		"TiKV Min Version: %s",
+		"TiKV Min Version: %s\n"+
+		"Check Table Before Drop: %v",
 		mysql.TiDBReleaseVersion,
 		TiDBGitHash,
 		TiDBGitBranch,
 		TiDBBuildTS,
 		GoVersion,
 		israce.RaceEnabled,
-		TiKVMinVersion)
+		TiKVMinVersion,
+		config.CheckTableBeforeDrop)
 }
 
 // checkValidity checks whether cols and every data have the same length.

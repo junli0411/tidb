@@ -34,10 +34,10 @@ var _ = Suite(&testDeleteRangeSuite{})
 func (s *testDeleteRangeSuite) SetUpTest(c *C) {
 	s.cluster = mocktikv.NewCluster()
 	mocktikv.BootstrapWithMultiRegions(s.cluster, []byte("a"), []byte("b"), []byte("c"))
-	client, pdClient, err := mocktikv.NewTestClient(s.cluster, nil, "")
+	client, pdClient, err := mocktikv.NewTiKVAndPDClient(s.cluster, nil, "")
 	c.Assert(err, IsNil)
 
-	store, err := NewTestTiKVStore(client, pdClient, nil, nil, false)
+	store, err := NewTestTiKVStore(client, pdClient, nil, nil, 0)
 	c.Check(err, IsNil)
 	s.store = store.(*tikvStore)
 }
@@ -50,7 +50,7 @@ func (s *testDeleteRangeSuite) TearDownTest(c *C) {
 func (s *testDeleteRangeSuite) checkData(c *C, expectedData map[string]string) {
 	txn, err := s.store.Begin()
 	c.Assert(err, IsNil)
-	it, err := txn.Seek([]byte("a"))
+	it, err := txn.Iter([]byte("a"), nil)
 	c.Assert(err, IsNil)
 
 	// Scan all data and save into a map
@@ -60,11 +60,12 @@ func (s *testDeleteRangeSuite) checkData(c *C, expectedData map[string]string) {
 		err = it.Next()
 		c.Assert(err, IsNil)
 	}
-	txn.Commit(context.Background())
+	err = txn.Commit(context.Background())
+	c.Assert(err, IsNil)
 
 	// Print log
-	var actualKeys []string
-	var expectedKeys []string
+	actualKeys := make([]string, 0, len(data))
+	expectedKeys := make([]string, 0, len(expectedData))
 	for key := range data {
 		actualKeys = append(actualKeys, key)
 	}
@@ -98,7 +99,7 @@ func deleteRangeFromMap(m map[string]string, startKey []byte, endKey []byte) {
 	}
 }
 
-// testDeleteRangeOnce does delete range on both the map and the storage, and assert they are equal after deleting
+// mustDeleteRange does delete range on both the map and the storage, and assert they are equal after deleting
 func (s *testDeleteRangeSuite) mustDeleteRange(c *C, startKey []byte, endKey []byte, expected map[string]string) {
 	s.deleteRange(c, startKey, endKey)
 	deleteRangeFromMap(expected, startKey, endKey)

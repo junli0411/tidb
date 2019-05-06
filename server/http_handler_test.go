@@ -30,27 +30,34 @@ import (
 
 	. "github.com/pingcap/check"
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
+	zaplog "github.com/pingcap/log"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
+	"github.com/pingcap/tidb/store/helper"
 	"github.com/pingcap/tidb/store/mockstore"
 	"github.com/pingcap/tidb/store/mockstore/mocktikv"
 	"github.com/pingcap/tidb/store/tikv"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/codec"
+	"github.com/pingcap/tidb/util/printer"
 	log "github.com/sirupsen/logrus"
+	"go.uber.org/zap"
 )
 
 type HTTPHandlerTestSuite struct {
-	server *Server
+	server  *Server
+	store   kv.Storage
+	domain  *domain.Domain
+	tidbdrv *TiDBDriver
 }
 
 var _ = Suite(new(HTTPHandlerTestSuite))
@@ -65,7 +72,7 @@ func (ts *HTTPHandlerTestSuite) TestRegionIndexRange(c *C) {
 		types.NewBytesDatum([]byte("foobar")),
 		types.NewFloat64Datum(-100.25),
 	}
-	var expectIndexValues []string
+	expectIndexValues := make([]string, 0, len(indexValues))
 	for _, v := range indexValues {
 		str, err := v.ToString()
 		if err != nil {
@@ -85,15 +92,14 @@ func (ts *HTTPHandlerTestSuite) TestRegionIndexRange(c *C) {
 		StartKey: startKey,
 		EndKey:   endKey,
 	}
-	r, err := NewRegionFrameRange(region)
+	r, err := helper.NewRegionFrameRange(region)
 	c.Assert(err, IsNil)
-	c.Assert(r.first.IndexID, Equals, sIndex)
-	c.Assert(r.first.IsRecord, IsFalse)
-	c.Assert(r.first.RecordID, Equals, int64(0))
-	c.Assert(r.first.IndexValues, DeepEquals, expectIndexValues)
-	c.Assert(r.last.IsRecord, IsTrue)
-	c.Assert(r.last.RecordID, Equals, recordID)
-	c.Assert(r.last.IndexValues, IsNil)
+	c.Assert(r.First.IndexID, Equals, sIndex)
+	c.Assert(r.First.IsRecord, IsFalse)
+	c.Assert(r.First.RecordID, Equals, int64(0))
+	c.Assert(r.First.IndexValues, DeepEquals, expectIndexValues)
+	c.Assert(r.Last.RecordID, Equals, recordID)
+	c.Assert(r.Last.IndexValues, IsNil)
 
 	testCases := []struct {
 		tableID int64
@@ -112,11 +118,11 @@ func (ts *HTTPHandlerTestSuite) TestRegionIndexRange(c *C) {
 		{10, 1, false},
 	}
 	for _, t := range testCases {
-		var f *FrameItem
+		var f *helper.FrameItem
 		if t.indexID == 0 {
-			f = r.getRecordFrame(t.tableID, "", "")
+			f = r.GetRecordFrame(t.tableID, "", "")
 		} else {
-			f = r.getIndexFrame(t.tableID, t.indexID, "", "", "")
+			f = r.GetIndexFrame(t.tableID, t.indexID, "", "", "")
 		}
 		if t.isCover {
 			c.Assert(f, NotNil)
@@ -135,12 +141,12 @@ func (ts *HTTPHandlerTestSuite) TestRegionIndexRangeWithEndNoLimit(c *C) {
 		StartKey: startKey,
 		EndKey:   endKey,
 	}
-	r, err := NewRegionFrameRange(region)
+	r, err := helper.NewRegionFrameRange(region)
 	c.Assert(err, IsNil)
-	c.Assert(r.first.IsRecord, IsTrue)
-	c.Assert(r.last.IsRecord, IsTrue)
-	c.Assert(r.getRecordFrame(300, "", ""), NotNil)
-	c.Assert(r.getIndexFrame(200, 100, "", "", ""), NotNil)
+	c.Assert(r.First.IsRecord, IsTrue)
+	c.Assert(r.Last.IsRecord, IsTrue)
+	c.Assert(r.GetRecordFrame(300, "", ""), NotNil)
+	c.Assert(r.GetIndexFrame(200, 100, "", "", ""), NotNil)
 }
 
 func (ts *HTTPHandlerTestSuite) TestRegionIndexRangeWithStartNoLimit(c *C) {
@@ -152,12 +158,12 @@ func (ts *HTTPHandlerTestSuite) TestRegionIndexRangeWithStartNoLimit(c *C) {
 		StartKey: startKey,
 		EndKey:   endKey,
 	}
-	r, err := NewRegionFrameRange(region)
+	r, err := helper.NewRegionFrameRange(region)
 	c.Assert(err, IsNil)
-	c.Assert(r.first.IsRecord, IsFalse)
-	c.Assert(r.last.IsRecord, IsTrue)
-	c.Assert(r.getRecordFrame(3, "", ""), NotNil)
-	c.Assert(r.getIndexFrame(8, 1, "", "", ""), NotNil)
+	c.Assert(r.First.IsRecord, IsFalse)
+	c.Assert(r.Last.IsRecord, IsTrue)
+	c.Assert(r.GetRecordFrame(3, "", ""), NotNil)
+	c.Assert(r.GetIndexFrame(8, 1, "", "", ""), NotNil)
 }
 
 func (ts *HTTPHandlerTestSuite) TestRegionsAPI(c *C) {
@@ -235,11 +241,12 @@ func (ts *HTTPHandlerTestSuite) TestRegionsFromMeta(c *C) {
 
 func (ts *HTTPHandlerTestSuite) startServer(c *C) {
 	mvccStore := mocktikv.MustNewMVCCStore()
-	store, err := mockstore.NewMockTikvStore(mockstore.WithMVCCStore(mvccStore))
+	var err error
+	ts.store, err = mockstore.NewMockTikvStore(mockstore.WithMVCCStore(mvccStore))
 	c.Assert(err, IsNil)
-	_, err = session.BootstrapSession(store)
+	ts.domain, err = session.BootstrapSession(ts.store)
 	c.Assert(err, IsNil)
-	tidbdrv := NewTiDBDriver(store)
+	ts.tidbdrv = NewTiDBDriver(ts.store)
 
 	cfg := config.NewConfig()
 	cfg.Port = 4001
@@ -247,7 +254,7 @@ func (ts *HTTPHandlerTestSuite) startServer(c *C) {
 	cfg.Status.StatusPort = 10090
 	cfg.Status.ReportStatus = true
 
-	server, err := NewServer(cfg, tidbdrv)
+	server, err := NewServer(cfg, ts.tidbdrv)
 	c.Assert(err, IsNil)
 	ts.server = server
 	go server.Run()
@@ -255,6 +262,12 @@ func (ts *HTTPHandlerTestSuite) startServer(c *C) {
 }
 
 func (ts *HTTPHandlerTestSuite) stopServer(c *C) {
+	if ts.domain != nil {
+		ts.domain.Close()
+	}
+	if ts.store != nil {
+		ts.store.Close()
+	}
 	if ts.server != nil {
 		ts.server.Close()
 	}
@@ -559,23 +572,65 @@ func (ts *HTTPHandlerTestSuite) TestGetSchema(c *C) {
 
 	_, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/schema/tidb/abc"))
 	c.Assert(err, IsNil)
+
+	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/db-table/5"))
+	c.Assert(err, IsNil)
+	var dbtbl *dbTableInfo
+	decoder = json.NewDecoder(resp.Body)
+	err = decoder.Decode(&dbtbl)
+	c.Assert(err, IsNil)
+	c.Assert(dbtbl.TableInfo.Name.L, Equals, "user")
+	c.Assert(dbtbl.DBInfo.Name.L, Equals, "mysql")
+	se, err := session.CreateSession(ts.store.(kv.Storage))
+	c.Assert(err, IsNil)
+	c.Assert(dbtbl.SchemaVersion, Equals, domain.GetDomain(se.(sessionctx.Context)).InfoSchema().SchemaMetaVersion())
+
+	db, err := sql.Open("mysql", getDSN())
+	c.Assert(err, IsNil, Commentf("Error connecting"))
+	defer db.Close()
+	dbt := &DBTest{c, db}
+
+	dbt.mustExec("create database if not exists test;")
+	dbt.mustExec("use test;")
+	dbt.mustExec(` create table t1 (id int KEY)
+		partition by range (id) (
+		PARTITION p0 VALUES LESS THAN (3),
+		PARTITION p1 VALUES LESS THAN (5),
+		PARTITION p2 VALUES LESS THAN (7),
+		PARTITION p3 VALUES LESS THAN (9))`)
+
+	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/schema/test/t1"))
+	c.Assert(err, IsNil)
+	decoder = json.NewDecoder(resp.Body)
+	err = decoder.Decode(&t)
+	c.Assert(err, IsNil)
+	c.Assert(t.Name.L, Equals, "t1")
+
+	resp, err = http.Get(fmt.Sprintf(fmt.Sprintf("http://127.0.0.1:10090/db-table/%v", t.GetPartitionInfo().Definitions[0].ID)))
+	c.Assert(err, IsNil)
+	decoder = json.NewDecoder(resp.Body)
+	err = decoder.Decode(&dbtbl)
+	c.Assert(err, IsNil)
+	c.Assert(dbtbl.TableInfo.Name.L, Equals, "t1")
+	c.Assert(dbtbl.DBInfo.Name.L, Equals, "test")
+	c.Assert(dbtbl.TableInfo, DeepEquals, t)
 }
 
 func (ts *HTTPHandlerTestSuite) TestAllHistory(c *C) {
 	ts.startServer(c)
 	ts.prepareData(c)
 	defer ts.stopServer(c)
-	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:10090/ddl/history/?limit=3"))
+	_, err := http.Get(fmt.Sprintf("http://127.0.0.1:10090/ddl/history/?limit=3"))
 	c.Assert(err, IsNil)
-	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/ddl/history/?limit=-1"))
+	_, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/ddl/history/?limit=-1"))
 	c.Assert(err, IsNil)
 
-	resp, err = http.Get(fmt.Sprintf("http://127.0.0.1:10090/ddl/history"))
+	resp, err := http.Get(fmt.Sprintf("http://127.0.0.1:10090/ddl/history"))
 	c.Assert(err, IsNil)
 	decoder := json.NewDecoder(resp.Body)
 
 	var jobs []*model.Job
-	s, _ := session.CreateSession(ts.server.newTikvHandlerTool().store.(kv.Storage))
+	s, _ := session.CreateSession(ts.server.newTikvHandlerTool().Store.(kv.Storage))
 	defer s.Close()
 	store := domain.GetDomain(s.(sessionctx.Context)).Store()
 	txn, _ := store.Begin()
@@ -599,6 +654,7 @@ func (ts *HTTPHandlerTestSuite) TestPostSettings(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(resp.StatusCode, Equals, http.StatusOK)
 	c.Assert(log.GetLevel(), Equals, log.ErrorLevel)
+	c.Assert(zaplog.GetLevel(), Equals, zap.ErrorLevel)
 	c.Assert(config.GetGlobalConfig().Log.Level, Equals, "error")
 	c.Assert(atomic.LoadUint32(&variable.ProcessGeneralLog), Equals, uint32(1))
 	form = make(url.Values)
@@ -609,7 +665,46 @@ func (ts *HTTPHandlerTestSuite) TestPostSettings(c *C) {
 	c.Assert(resp.StatusCode, Equals, http.StatusOK)
 	c.Assert(atomic.LoadUint32(&variable.ProcessGeneralLog), Equals, uint32(0))
 	c.Assert(log.GetLevel(), Equals, log.InfoLevel)
+	c.Assert(zaplog.GetLevel(), Equals, zap.InfoLevel)
 	c.Assert(config.GetGlobalConfig().Log.Level, Equals, "info")
+
+	// test ddl_slow_threshold
+	form = make(url.Values)
+	form.Set("ddl_slow_threshold", "200")
+	resp, err = http.PostForm("http://127.0.0.1:10090/settings", form)
+	c.Assert(err, IsNil)
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
+	c.Assert(atomic.LoadUint32(&variable.DDLSlowOprThreshold), Equals, uint32(200))
+
+	// test check_mb4_value_in_utf8
+	db, err := sql.Open("mysql", getDSN())
+	c.Assert(err, IsNil, Commentf("Error connecting"))
+	defer db.Close()
+	dbt := &DBTest{c, db}
+
+	dbt.mustExec("create database tidb_test;")
+	dbt.mustExec("use tidb_test;")
+	dbt.mustExec("drop table if exists t2;")
+	dbt.mustExec("create table t2(a varchar(100) charset utf8);")
+	form.Set("check_mb4_value_in_utf8", "1")
+	resp, err = http.PostForm("http://127.0.0.1:10090/settings", form)
+	c.Assert(err, IsNil)
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
+	c.Assert(config.GetGlobalConfig().CheckMb4ValueInUTF8, Equals, true)
+	txn1, err := dbt.db.Begin()
+	c.Assert(err, IsNil)
+	_, err = txn1.Exec("insert t2 values (unhex('F0A48BAE'));")
+	c.Assert(err, NotNil)
+	txn1.Commit()
+
+	// Disable CheckMb4ValueInUTF8.
+	form = make(url.Values)
+	form.Set("check_mb4_value_in_utf8", "0")
+	resp, err = http.PostForm("http://127.0.0.1:10090/settings", form)
+	c.Assert(err, IsNil)
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
+	c.Assert(config.GetGlobalConfig().CheckMb4ValueInUTF8, Equals, false)
+	dbt.mustExec("insert t2 values (unhex('f09f8c80'));")
 }
 
 func (ts *HTTPHandlerTestSuite) TestPprof(c *C) {
@@ -625,5 +720,66 @@ func (ts *HTTPHandlerTestSuite) TestPprof(c *C) {
 		}
 		time.Sleep(time.Millisecond * 10)
 	}
-	log.Fatalf("Failed to get profile for %d retries in every 10 ms", retryTime)
+	zaplog.Fatal("failed to get profile for %d retries in every 10 ms", zap.Int("retryTime", retryTime))
+}
+
+func (ts *HTTPHandlerTestSuite) TestServerInfo(c *C) {
+	ts.startServer(c)
+	defer ts.stopServer(c)
+	resp, err := http.Get("http://127.0.0.1:10090/info")
+	c.Assert(err, IsNil)
+	defer resp.Body.Close()
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
+	decoder := json.NewDecoder(resp.Body)
+
+	info := serverInfo{}
+	err = decoder.Decode(&info)
+	c.Assert(err, IsNil)
+
+	cfg := config.GetGlobalConfig()
+	c.Assert(info.IsOwner, IsTrue)
+	c.Assert(info.IP, Equals, cfg.AdvertiseAddress)
+	c.Assert(info.StatusPort, Equals, cfg.Status.StatusPort)
+	c.Assert(info.Lease, Equals, cfg.Lease)
+	c.Assert(info.Version, Equals, mysql.ServerVersion)
+	c.Assert(info.GitHash, Equals, printer.TiDBGitHash)
+
+	store := ts.server.newTikvHandlerTool().Store.(kv.Storage)
+	do, err := session.GetDomain(store.(kv.Storage))
+	c.Assert(err, IsNil)
+	ddl := do.DDL()
+	c.Assert(info.ID, Equals, ddl.GetID())
+}
+
+func (ts *HTTPHandlerTestSuite) TestAllServerInfo(c *C) {
+	ts.startServer(c)
+	defer ts.stopServer(c)
+	resp, err := http.Get("http://127.0.0.1:10090/info/all")
+	c.Assert(err, IsNil)
+	defer resp.Body.Close()
+	c.Assert(resp.StatusCode, Equals, http.StatusOK)
+	decoder := json.NewDecoder(resp.Body)
+
+	clusterInfo := clusterServerInfo{}
+	err = decoder.Decode(&clusterInfo)
+	c.Assert(err, IsNil)
+
+	c.Assert(clusterInfo.IsAllServerVersionConsistent, IsTrue)
+	c.Assert(clusterInfo.ServersNum, Equals, 1)
+
+	store := ts.server.newTikvHandlerTool().Store.(kv.Storage)
+	do, err := session.GetDomain(store.(kv.Storage))
+	c.Assert(err, IsNil)
+	ddl := do.DDL()
+	c.Assert(clusterInfo.OwnerID, Equals, ddl.GetID())
+	serverInfo, ok := clusterInfo.AllServersInfo[ddl.GetID()]
+	c.Assert(ok, Equals, true)
+
+	cfg := config.GetGlobalConfig()
+	c.Assert(serverInfo.IP, Equals, cfg.AdvertiseAddress)
+	c.Assert(serverInfo.StatusPort, Equals, cfg.Status.StatusPort)
+	c.Assert(serverInfo.Lease, Equals, cfg.Lease)
+	c.Assert(serverInfo.Version, Equals, mysql.ServerVersion)
+	c.Assert(serverInfo.GitHash, Equals, printer.TiDBGitHash)
+	c.Assert(serverInfo.ID, Equals, ddl.GetID())
 }

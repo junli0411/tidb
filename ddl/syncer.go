@@ -14,19 +14,22 @@
 package ddl
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/clientv3/concurrency"
-	"github.com/juju/errors"
+	"github.com/pingcap/errors"
 	"github.com/pingcap/tidb/metrics"
 	"github.com/pingcap/tidb/owner"
-	log "github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
+	"github.com/pingcap/tidb/util/logutil"
+	"go.uber.org/zap"
 )
 
 const (
@@ -38,14 +41,13 @@ const (
 	DDLGlobalSchemaVersion = "/tidb/ddl/global_schema_version"
 	// InitialVersion is the initial schema version for every server.
 	// It's exported for testing.
-	InitialVersion           = "0"
-	putKeyNoRetry            = 1
-	keyOpDefaultRetryCnt     = 3
-	putKeyRetryUnlimited     = math.MaxInt64
-	keyOpDefaultTimeout      = 2 * time.Second
-	keyOpRetryInterval       = 30 * time.Millisecond
-	checkVersInterval        = 20 * time.Millisecond
-	waitTimeWhenErrorOccured = 1 * time.Second
+	InitialVersion       = "0"
+	putKeyNoRetry        = 1
+	keyOpDefaultRetryCnt = 3
+	putKeyRetryUnlimited = math.MaxInt64
+	keyOpDefaultTimeout  = 2 * time.Second
+	keyOpRetryInterval   = 30 * time.Millisecond
+	checkVersInterval    = 20 * time.Millisecond
 )
 
 var (
@@ -55,6 +57,8 @@ var (
 	// SyncerSessionTTL is the etcd session's TTL in seconds.
 	// and it's an exported variable for testing.
 	SyncerSessionTTL = 10 * 60
+	// WaitTimeWhenErrorOccured is waiting interval when processing DDL jobs encounter errors.
+	WaitTimeWhenErrorOccured = 1 * time.Second
 )
 
 // SchemaSyncer is used to synchronize schema version between the DDL worker leader and followers through etcd.
@@ -87,7 +91,7 @@ type SchemaSyncer interface {
 type schemaVersionSyncer struct {
 	selfSchemaVerPath string
 	etcdCli           *clientv3.Client
-	session           *concurrency.Session
+	session           unsafe.Pointer
 	mu                struct {
 		sync.RWMutex
 		globalVerCh clientv3.WatchChan
@@ -102,7 +106,11 @@ func NewSchemaSyncer(etcdCli *clientv3.Client, id string) SchemaSyncer {
 	}
 }
 
-func (s *schemaVersionSyncer) putKV(ctx context.Context, retryCnt int, key, val string,
+// PutKVToEtcd puts key value to etcd.
+// etcdCli is client of etcd.
+// retryCnt is retry time when an error occurs.
+// opts is configures of etcd Operations.
+func PutKVToEtcd(ctx context.Context, etcdCli *clientv3.Client, retryCnt int, key, val string,
 	opts ...clientv3.OpOption) error {
 	var err error
 	for i := 0; i < retryCnt; i++ {
@@ -111,12 +119,12 @@ func (s *schemaVersionSyncer) putKV(ctx context.Context, retryCnt int, key, val 
 		}
 
 		childCtx, cancel := context.WithTimeout(ctx, keyOpDefaultTimeout)
-		_, err = s.etcdCli.Put(childCtx, key, val, opts...)
+		_, err = etcdCli.Put(childCtx, key, val, opts...)
 		cancel()
 		if err == nil {
 			return nil
 		}
-		log.Warnf("[syncer] put schema version %s failed %v no.%d", val, err, i)
+		logutil.Logger(ddlLogCtx).Warn("[ddl] etcd-cli put kv failed", zap.String("key", key), zap.String("value", val), zap.Error(err), zap.Int("retryCnt", i))
 		time.Sleep(keyOpRetryInterval)
 	}
 	return errors.Trace(err)
@@ -138,23 +146,32 @@ func (s *schemaVersionSyncer) Init(ctx context.Context) error {
 		return errors.Trace(err)
 	}
 	logPrefix := fmt.Sprintf("[%s] %s", ddlPrompt, s.selfSchemaVerPath)
-	s.session, err = owner.NewSession(ctx, logPrefix, s.etcdCli, owner.NewSessionDefaultRetryCnt, SyncerSessionTTL)
+	session, err := owner.NewSession(ctx, logPrefix, s.etcdCli, owner.NewSessionDefaultRetryCnt, SyncerSessionTTL)
 	if err != nil {
 		return errors.Trace(err)
 	}
+	s.storeSession(session)
 
 	s.mu.Lock()
 	s.mu.globalVerCh = s.etcdCli.Watch(ctx, DDLGlobalSchemaVersion)
 	s.mu.Unlock()
 
-	err = s.putKV(ctx, keyOpDefaultRetryCnt, s.selfSchemaVerPath, InitialVersion,
-		clientv3.WithLease(s.session.Lease()))
+	err = PutKVToEtcd(ctx, s.etcdCli, keyOpDefaultRetryCnt, s.selfSchemaVerPath, InitialVersion,
+		clientv3.WithLease(s.loadSession().Lease()))
 	return errors.Trace(err)
+}
+
+func (s *schemaVersionSyncer) loadSession() *concurrency.Session {
+	return (*concurrency.Session)(atomic.LoadPointer(&s.session))
+}
+
+func (s *schemaVersionSyncer) storeSession(session *concurrency.Session) {
+	atomic.StorePointer(&s.session, (unsafe.Pointer)(session))
 }
 
 // Done implements SchemaSyncer.Done interface.
 func (s *schemaVersionSyncer) Done() <-chan struct{} {
-	return s.session.Done()
+	return s.loadSession().Done()
 }
 
 // Restart implements SchemaSyncer.Restart interface.
@@ -171,12 +188,12 @@ func (s *schemaVersionSyncer) Restart(ctx context.Context) error {
 	if err != nil {
 		return errors.Trace(err)
 	}
-	s.session = session
+	s.storeSession(session)
 
 	childCtx, cancel := context.WithTimeout(ctx, keyOpDefaultTimeout)
 	defer cancel()
-	err = s.putKV(childCtx, putKeyRetryUnlimited, s.selfSchemaVerPath, InitialVersion,
-		clientv3.WithLease(s.session.Lease()))
+	err = PutKVToEtcd(childCtx, s.etcdCli, putKeyRetryUnlimited, s.selfSchemaVerPath, InitialVersion,
+		clientv3.WithLease(s.loadSession().Lease()))
 
 	return errors.Trace(err)
 }
@@ -205,7 +222,7 @@ func (s *schemaVersionSyncer) WatchGlobalSchemaVer(ctx context.Context) {
 		s.mu.Lock()
 		s.mu.globalVerCh = ch
 		s.mu.Unlock()
-		log.Info("[syncer] watch global schema finished")
+		logutil.Logger(ddlLogCtx).Info("[ddl] syncer watch global schema finished")
 	}()
 }
 
@@ -213,8 +230,8 @@ func (s *schemaVersionSyncer) WatchGlobalSchemaVer(ctx context.Context) {
 func (s *schemaVersionSyncer) UpdateSelfVersion(ctx context.Context, version int64) error {
 	startTime := time.Now()
 	ver := strconv.FormatInt(version, 10)
-	err := s.putKV(ctx, putKeyNoRetry, s.selfSchemaVerPath, ver,
-		clientv3.WithLease(s.session.Lease()))
+	err := PutKVToEtcd(ctx, s.etcdCli, putKeyNoRetry, s.selfSchemaVerPath, ver,
+		clientv3.WithLease(s.loadSession().Lease()))
 
 	metrics.UpdateSelfVersionHistogram.WithLabelValues(metrics.RetLabel(err)).Observe(time.Since(startTime).Seconds())
 	return errors.Trace(err)
@@ -224,8 +241,9 @@ func (s *schemaVersionSyncer) UpdateSelfVersion(ctx context.Context, version int
 func (s *schemaVersionSyncer) OwnerUpdateGlobalVersion(ctx context.Context, version int64) error {
 	startTime := time.Now()
 	ver := strconv.FormatInt(version, 10)
-	err := s.putKV(ctx, putKeyRetryUnlimited, DDLGlobalSchemaVersion, ver)
-
+	// TODO: If the version is larger than the original global version, we need set the version.
+	// Otherwise, we'd better set the original global version.
+	err := PutKVToEtcd(ctx, s.etcdCli, putKeyRetryUnlimited, DDLGlobalSchemaVersion, ver)
 	metrics.OwnerHandleSyncerHistogram.WithLabelValues(metrics.OwnerUpdateGlobalVersion, metrics.RetLabel(err)).Observe(time.Since(startTime).Seconds())
 	return errors.Trace(err)
 }
@@ -238,15 +256,22 @@ func (s *schemaVersionSyncer) RemoveSelfVersionPath() error {
 		metrics.DeploySyncerHistogram.WithLabelValues(metrics.SyncerClear, metrics.RetLabel(err)).Observe(time.Since(startTime).Seconds())
 	}()
 
+	err = DeleteKeyFromEtcd(s.selfSchemaVerPath, s.etcdCli, keyOpDefaultRetryCnt, keyOpDefaultTimeout)
+	return errors.Trace(err)
+}
+
+// DeleteKeyFromEtcd deletes key value from etcd.
+func DeleteKeyFromEtcd(key string, etcdCli *clientv3.Client, retryCnt int, timeout time.Duration) error {
+	var err error
 	ctx := context.Background()
-	for i := 0; i < keyOpDefaultRetryCnt; i++ {
-		childCtx, cancel := context.WithTimeout(ctx, keyOpDefaultTimeout)
-		_, err = s.etcdCli.Delete(childCtx, s.selfSchemaVerPath)
+	for i := 0; i < retryCnt; i++ {
+		childCtx, cancel := context.WithTimeout(ctx, timeout)
+		_, err = etcdCli.Delete(childCtx, key)
 		cancel()
 		if err == nil {
 			return nil
 		}
-		log.Warnf("[syncer] remove schema version path %s failed %v no.%d", s.selfSchemaVerPath, err, i)
+		logutil.Logger(ddlLogCtx).Warn("[ddl] etcd-cli delete key failed", zap.String("key", key), zap.Error(err), zap.Int("retryCnt", i))
 	}
 	return errors.Trace(err)
 }
@@ -254,8 +279,11 @@ func (s *schemaVersionSyncer) RemoveSelfVersionPath() error {
 // MustGetGlobalVersion implements SchemaSyncer.MustGetGlobalVersion interface.
 func (s *schemaVersionSyncer) MustGetGlobalVersion(ctx context.Context) (int64, error) {
 	startTime := time.Now()
-	var err error
-	var resp *clientv3.GetResponse
+	var (
+		err  error
+		ver  int
+		resp *clientv3.GetResponse
+	)
 	failedCnt := 0
 	intervalCnt := int(time.Second / keyOpRetryInterval)
 
@@ -265,7 +293,7 @@ func (s *schemaVersionSyncer) MustGetGlobalVersion(ctx context.Context) (int64, 
 	for {
 		if err != nil {
 			if failedCnt%intervalCnt == 0 {
-				log.Infof("[syncer] get global version failed %v", err)
+				logutil.Logger(ddlLogCtx).Info("[ddl] syncer get global version failed", zap.Error(err))
 			}
 			time.Sleep(keyOpRetryInterval)
 			failedCnt++
@@ -280,8 +308,7 @@ func (s *schemaVersionSyncer) MustGetGlobalVersion(ctx context.Context) (int64, 
 		if err != nil {
 			continue
 		}
-		if err == nil && len(resp.Kvs) > 0 {
-			var ver int
+		if len(resp.Kvs) > 0 {
 			ver, err = strconv.Atoi(string(resp.Kvs[0].Value))
 			if err == nil {
 				return int64(ver), nil
@@ -309,7 +336,7 @@ func (s *schemaVersionSyncer) OwnerCheckAllVersions(ctx context.Context, latestV
 
 	var err error
 	defer func() {
-		metrics.OwnerHandleSyncerHistogram.WithLabelValues(metrics.OwnerGetGlobalVersion, metrics.RetLabel(err)).Observe(time.Since(startTime).Seconds())
+		metrics.OwnerHandleSyncerHistogram.WithLabelValues(metrics.OwnerCheckAllVersions, metrics.RetLabel(err)).Observe(time.Since(startTime).Seconds())
 	}()
 	for {
 		if isContextDone(ctx) {
@@ -320,7 +347,7 @@ func (s *schemaVersionSyncer) OwnerCheckAllVersions(ctx context.Context, latestV
 
 		resp, err := s.etcdCli.Get(ctx, DDLAllSchemaVersions, clientv3.WithPrefix())
 		if err != nil {
-			log.Infof("[syncer] check all versions failed %v, continue checking.", err)
+			logutil.Logger(ddlLogCtx).Info("[ddl] syncer check all versions failed, continue checking.", zap.Error(err))
 			continue
 		}
 
@@ -332,14 +359,14 @@ func (s *schemaVersionSyncer) OwnerCheckAllVersions(ctx context.Context, latestV
 
 			ver, err := strconv.Atoi(string(kv.Value))
 			if err != nil {
-				log.Infof("[syncer] check all versions, ddl %s convert %v to int failed %v, continue checking.", kv.Key, kv.Value, err)
+				logutil.Logger(ddlLogCtx).Info("[ddl] syncer check all versions, convert value to int failed, continue checking.", zap.String("ddl", string(kv.Key)), zap.String("value", string(kv.Value)), zap.Error(err))
 				succ = false
 				break
 			}
-			if int64(ver) != latestVer {
+			if int64(ver) < latestVer {
 				if notMatchVerCnt%intervalCnt == 0 {
-					log.Infof("[syncer] check all versions, ddl %s is not synced, current ver %v, latest version %v, continue checking",
-						kv.Key, ver, latestVer)
+					logutil.Logger(ddlLogCtx).Info("[ddl] syncer check all versions, someone is not synced, continue checking",
+						zap.String("ddl", string(kv.Key)), zap.Int("currentVer", ver), zap.Int64("latestVer", latestVer))
 				}
 				succ = false
 				notMatchVerCnt++

@@ -14,18 +14,20 @@
 package executor
 
 import (
-	"bytes"
+	"context"
 	"fmt"
 	"strings"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/ast"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/ast"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/table"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
-	log "github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
+	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tidb/util/stringutil"
+	"go.uber.org/zap"
 )
 
 // LoadDataExec represents a load data executor.
@@ -36,21 +38,22 @@ type LoadDataExec struct {
 	loadDataInfo *LoadDataInfo
 }
 
+var insertValuesLabel fmt.Stringer = stringutil.StringerStr("InsertValues")
+
 // NewLoadDataInfo returns a LoadDataInfo structure, and it's only used for tests now.
-func NewLoadDataInfo(ctx sessionctx.Context, row types.DatumRow, tbl table.Table, cols []*table.Column) *LoadDataInfo {
-	insertVal := &InsertValues{baseExecutor: newBaseExecutor(ctx, nil, "InsertValues"), Table: tbl}
+func NewLoadDataInfo(ctx sessionctx.Context, row []types.Datum, tbl table.Table, cols []*table.Column) *LoadDataInfo {
+	insertVal := &InsertValues{baseExecutor: newBaseExecutor(ctx, nil, insertValuesLabel), Table: tbl}
 	return &LoadDataInfo{
 		row:          row,
 		InsertValues: insertVal,
 		Table:        tbl,
 		Ctx:          ctx,
-		columns:      cols,
 	}
 }
 
 // Next implements the Executor Next interface.
-func (e *LoadDataExec) Next(ctx context.Context, chk *chunk.Chunk) error {
-	chk.Reset()
+func (e *LoadDataExec) Next(ctx context.Context, req *chunk.RecordBatch) error {
+	req.GrowAndReset(e.maxChunkSize)
 	// TODO: support load data without local field.
 	if !e.IsLocal {
 		return errors.New("Load Data: don't support load data without local field")
@@ -81,6 +84,9 @@ func (e *LoadDataExec) Close() error {
 
 // Open implements the Executor Open interface.
 func (e *LoadDataExec) Open(ctx context.Context) error {
+	if e.loadDataInfo.insertColumns != nil {
+		e.loadDataInfo.initEvalBuffer()
+	}
 	return nil
 }
 
@@ -88,14 +94,13 @@ func (e *LoadDataExec) Open(ctx context.Context) error {
 type LoadDataInfo struct {
 	*InsertValues
 
-	row types.DatumRow
-
-	Path       string
-	Table      table.Table
-	FieldsInfo *ast.FieldsClause
-	LinesInfo  *ast.LinesClause
-	Ctx        sessionctx.Context
-	columns    []*table.Column
+	row         []types.Datum
+	Path        string
+	Table       table.Table
+	FieldsInfo  *ast.FieldsClause
+	LinesInfo   *ast.LinesClause
+	IgnoreLines uint64
+	Ctx         sessionctx.Context
 }
 
 // SetMaxRowsInBatch sets the max number of rows to insert in a batch.
@@ -200,26 +205,23 @@ func (e *LoadDataInfo) getLine(prevData, curData []byte) ([]byte, []byte, bool) 
 }
 
 // InsertData inserts data into specified table according to the specified format.
-// If it has the rest of data isn't completed the processing, then is returns without completed data.
+// If it has the rest of data isn't completed the processing, then it returns without completed data.
 // If the number of inserted rows reaches the batchRows, then the second return value is true.
 // If prevData isn't nil and curData is nil, there are no other data to deal with and the isEOF is true.
 func (e *LoadDataInfo) InsertData(prevData, curData []byte) ([]byte, bool, error) {
-	// TODO: support enclosed and escape.
 	if len(prevData) == 0 && len(curData) == 0 {
 		return nil, false, nil
 	}
-
 	var line []byte
 	var isEOF, hasStarting, reachLimit bool
 	if len(prevData) > 0 && len(curData) == 0 {
 		isEOF = true
 		prevData, curData = curData, prevData
 	}
-	rows := make([]types.DatumRow, 0, e.maxRowsInBatch)
+	rows := make([][]types.Datum, 0, e.maxRowsInBatch)
 	for len(curData) > 0 {
 		line, curData, hasStarting = e.getLine(prevData, curData)
 		prevData = nil
-
 		// If it doesn't find the terminated symbol and this data isn't the last data,
 		// the data can't be inserted.
 		if line == nil && !isEOF {
@@ -237,110 +239,270 @@ func (e *LoadDataInfo) InsertData(prevData, curData []byte) ([]byte, bool, error
 			curData = nil
 		}
 
-		cols, err := e.GetFieldsFromLine(line)
+		if e.IgnoreLines > 0 {
+			e.IgnoreLines--
+			continue
+		}
+		cols, err := e.getFieldsFromLine(line)
 		if err != nil {
-			return nil, false, errors.Trace(err)
+			return nil, false, err
 		}
 		rows = append(rows, e.colsToRow(cols))
 		e.rowCount++
 		if e.maxRowsInBatch != 0 && e.rowCount%e.maxRowsInBatch == 0 {
 			reachLimit = true
-			log.Infof("This insert rows has reached the batch %d, current total rows %d",
-				e.maxRowsInBatch, e.rowCount)
+			logutil.Logger(context.Background()).Info("batch limit hit when inserting rows", zap.Int("maxBatchRows", e.maxChunkSize),
+				zap.Uint64("totalRows", e.rowCount))
 			break
 		}
 	}
-	rows, err := e.batchMarkDupRows(rows)
+	e.ctx.GetSessionVars().StmtCtx.AddRecordRows(uint64(len(rows)))
+	err := e.batchCheckAndInsert(rows, e.addRecordLD)
 	if err != nil {
-		return nil, reachLimit, errors.Trace(err)
+		return nil, reachLimit, err
 	}
-	for _, row := range rows {
-		e.insertData(row)
-	}
-	if e.lastInsertID != 0 {
-		e.ctx.GetSessionVars().SetLastInsertID(e.lastInsertID)
-	}
-
 	return curData, reachLimit, nil
 }
 
-func (e *LoadDataInfo) colsToRow(cols []string) types.DatumRow {
+// SetMessage sets info message(ERR_LOAD_INFO) generated by LOAD statement, it is public because of the special way that
+// LOAD statement is handled.
+func (e *LoadDataInfo) SetMessage() {
+	stmtCtx := e.ctx.GetSessionVars().StmtCtx
+	numRecords := stmtCtx.RecordRows()
+	numDeletes := 0
+	numSkipped := numRecords - stmtCtx.CopiedRows()
+	numWarnings := stmtCtx.WarningCount()
+	msg := fmt.Sprintf(mysql.MySQLErrName[mysql.ErrLoadInfo], numRecords, numDeletes, numSkipped, numWarnings)
+	e.ctx.GetSessionVars().StmtCtx.SetMessage(msg)
+}
+
+func (e *LoadDataInfo) colsToRow(cols []field) []types.Datum {
 	for i := 0; i < len(e.row); i++ {
 		if i >= len(cols) {
-			e.row[i].SetString("")
+			e.row[i].SetNull()
 			continue
 		}
-		e.row[i].SetString(cols[i])
+		// The field with only "\N" in it is handled as NULL in the csv file.
+		// See http://dev.mysql.com/doc/refman/5.7/en/load-data.html
+		if cols[i].maybeNull && string(cols[i].str) == "N" {
+			e.row[i].SetNull()
+		} else {
+			e.row[i].SetString(string(cols[i].str))
+		}
 	}
-	row, err := e.fillRowData(e.columns, e.row)
+	row, err := e.getRow(e.row)
 	if err != nil {
-		warnLog := fmt.Sprintf("Load Data: insert data:%v failed:%v", e.row, errors.ErrorStack(err))
-		e.handleLoadDataWarnings(err, warnLog)
+		e.handleWarning(err)
 		return nil
 	}
 	return row
 }
 
-func (e *LoadDataInfo) insertData(row types.DatumRow) {
+func (e *LoadDataInfo) addRecordLD(row []types.Datum) (int64, error) {
 	if row == nil {
-		return
+		return 0, nil
 	}
-	_, err := e.Table.AddRecord(e.ctx, row, false)
+	h, err := e.addRecord(row)
 	if err != nil {
-		warnLog := fmt.Sprintf("Load Data: insert data:%v failed:%v", row, errors.ErrorStack(err))
-		e.handleLoadDataWarnings(err, warnLog)
+		e.handleWarning(err)
 	}
+	return h, nil
 }
 
-// GetFieldsFromLine splits line according to fieldsInfo, this function is exported for testing.
-func (e *LoadDataInfo) GetFieldsFromLine(line []byte) ([]string, error) {
-	var sep []byte
-	if e.FieldsInfo.Enclosed != 0 {
-		if line[0] != e.FieldsInfo.Enclosed || line[len(line)-1] != e.FieldsInfo.Enclosed {
-			return nil, errors.Errorf("line %s should begin and end with %c", string(line), e.FieldsInfo.Enclosed)
+type field struct {
+	str       []byte
+	maybeNull bool
+	enclosed  bool
+}
+
+type fieldWriter struct {
+	pos           int
+	enclosedChar  byte
+	fieldTermChar byte
+	term          *string
+	isEnclosed    bool
+	isLineStart   bool
+	isFieldStart  bool
+	ReadBuf       *[]byte
+	OutputBuf     []byte
+}
+
+func (w *fieldWriter) Init(enclosedChar byte, fieldTermChar byte, readBuf *[]byte, term *string) {
+	w.isEnclosed = false
+	w.isLineStart = true
+	w.isFieldStart = true
+	w.ReadBuf = readBuf
+	w.enclosedChar = enclosedChar
+	w.fieldTermChar = fieldTermChar
+	w.term = term
+}
+
+func (w *fieldWriter) putback() {
+	w.pos--
+}
+
+func (w *fieldWriter) getChar() (bool, byte) {
+	if w.pos < len(*w.ReadBuf) {
+		ret := (*w.ReadBuf)[w.pos]
+		w.pos++
+		return true, ret
+	}
+	return false, 0
+}
+
+func (w *fieldWriter) isTerminator() bool {
+	chkpt, isterm := w.pos, true
+	for i := 1; i < len(*w.term); i++ {
+		flag, ch := w.getChar()
+		if !flag || ch != (*w.term)[i] {
+			isterm = false
+			break
 		}
-		line = line[1 : len(line)-1]
-		sep = make([]byte, 0, len(e.FieldsInfo.Terminated)+2)
-		sep = append(sep, e.FieldsInfo.Enclosed)
-		sep = append(sep, e.FieldsInfo.Terminated...)
-		sep = append(sep, e.FieldsInfo.Enclosed)
-	} else {
-		sep = []byte(e.FieldsInfo.Terminated)
 	}
-	rawCols := bytes.Split(line, sep)
-	cols := escapeCols(rawCols)
-	return cols, nil
+	if !isterm {
+		w.pos = chkpt
+		return false
+	}
+	return true
 }
 
-func escapeCols(strs [][]byte) []string {
-	ret := make([]string, len(strs))
-	for i, v := range strs {
-		output := escape(v)
-		ret[i] = string(output)
+func (w *fieldWriter) outputField(enclosed bool) field {
+	var fild []byte
+	start := 0
+	if enclosed {
+		start = 1
 	}
-	return ret
+	for i := start; i < len(w.OutputBuf); i++ {
+		fild = append(fild, w.OutputBuf[i])
+	}
+	if len(fild) == 0 {
+		fild = []byte("")
+	}
+	w.OutputBuf = w.OutputBuf[0:0]
+	w.isEnclosed = false
+	w.isFieldStart = true
+	return field{fild, false, enclosed}
+}
+
+func (w *fieldWriter) GetField() (bool, field) {
+	// The first return value implies whether fieldWriter read the last character of line.
+	if w.isLineStart {
+		_, ch := w.getChar()
+		if ch == w.enclosedChar {
+			w.isEnclosed = true
+			w.isFieldStart, w.isLineStart = false, false
+			w.OutputBuf = append(w.OutputBuf, ch)
+		} else {
+			w.putback()
+		}
+	}
+	for {
+		flag, ch := w.getChar()
+		if !flag {
+			ret := w.outputField(false)
+			return true, ret
+		}
+		if ch == w.enclosedChar && w.isFieldStart {
+			// If read enclosed char at field start.
+			w.isEnclosed = true
+			w.OutputBuf = append(w.OutputBuf, ch)
+			w.isLineStart, w.isFieldStart = false, false
+			continue
+		}
+		w.isLineStart, w.isFieldStart = false, false
+		if ch == w.fieldTermChar && !w.isEnclosed {
+			// If read filed terminate char.
+			if w.isTerminator() {
+				ret := w.outputField(false)
+				return false, ret
+			}
+			w.OutputBuf = append(w.OutputBuf, ch)
+		} else if ch == w.enclosedChar && w.isEnclosed {
+			// If read enclosed char, look ahead.
+			flag, ch = w.getChar()
+			if !flag {
+				ret := w.outputField(true)
+				return true, ret
+			} else if ch == w.enclosedChar {
+				w.OutputBuf = append(w.OutputBuf, ch)
+				continue
+			} else if ch == w.fieldTermChar {
+				// If the next char is fieldTermChar, look ahead.
+				if w.isTerminator() {
+					ret := w.outputField(true)
+					return false, ret
+				}
+				w.OutputBuf = append(w.OutputBuf, ch)
+			} else {
+				// If there is no terminator behind enclosedChar, put the char back.
+				w.OutputBuf = append(w.OutputBuf, w.enclosedChar)
+				w.putback()
+			}
+		} else if ch == '\\' {
+			// TODO: escape only support '\'
+			w.OutputBuf = append(w.OutputBuf, ch)
+			flag, ch = w.getChar()
+			if flag {
+				if ch == w.enclosedChar {
+					w.OutputBuf = append(w.OutputBuf, ch)
+				} else {
+					w.putback()
+				}
+			}
+		} else {
+			w.OutputBuf = append(w.OutputBuf, ch)
+		}
+	}
+}
+
+// getFieldsFromLine splits line according to fieldsInfo.
+func (e *LoadDataInfo) getFieldsFromLine(line []byte) ([]field, error) {
+	var (
+		reader fieldWriter
+		fields []field
+	)
+
+	if len(line) == 0 {
+		str := []byte("")
+		fields = append(fields, field{str, false, false})
+		return fields, nil
+	}
+
+	reader.Init(e.FieldsInfo.Enclosed, e.FieldsInfo.Terminated[0], &line, &e.FieldsInfo.Terminated)
+	for {
+		eol, f := reader.GetField()
+		f = f.escape()
+		if string(f.str) == "NULL" && !f.enclosed {
+			f.str = []byte{'N'}
+			f.maybeNull = true
+		}
+		fields = append(fields, f)
+		if eol {
+			break
+		}
+	}
+	return fields, nil
 }
 
 // escape handles escape characters when running load data statement.
-// TODO: escape need to be improved, it should support ESCAPED BY to specify
-// the escape character and handle \N escape.
 // See http://dev.mysql.com/doc/refman/5.7/en/load-data.html
-func escape(str []byte) []byte {
+// TODO: escape only support '\' as the `ESCAPED BY` character, it should support specify characters.
+func (f *field) escape() field {
 	pos := 0
-	for i := 0; i < len(str); i++ {
-		c := str[i]
-		if c == '\\' && i+1 < len(str) {
-			c = escapeChar(str[i+1])
+	for i := 0; i < len(f.str); i++ {
+		c := f.str[i]
+		if i+1 < len(f.str) && f.str[i] == '\\' {
+			c = f.escapeChar(f.str[i+1])
 			i++
 		}
 
-		str[pos] = c
+		f.str[pos] = c
 		pos++
 	}
-	return str[:pos]
+	return field{f.str[:pos], f.maybeNull, f.enclosed}
 }
 
-func escapeChar(c byte) byte {
+func (f *field) escapeChar(c byte) byte {
 	switch c {
 	case '0':
 		return 0
@@ -354,10 +516,14 @@ func escapeChar(c byte) byte {
 		return '\t'
 	case 'Z':
 		return 26
+	case 'N':
+		f.maybeNull = true
+		return c
 	case '\\':
-		return '\\'
+		return c
+	default:
+		return c
 	}
-	return c
 }
 
 // loadDataVarKeyType is a dummy type to avoid naming collision in context.

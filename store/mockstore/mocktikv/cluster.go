@@ -15,6 +15,7 @@ package mocktikv
 
 import (
 	"bytes"
+	"context"
 	"math"
 	"sync"
 
@@ -22,7 +23,6 @@ import (
 	"github.com/pingcap/kvproto/pkg/kvrpcpb"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/tidb/tablecodec"
-	"golang.org/x/net/context"
 )
 
 // Cluster simulates a TiKV cluster. It focuses on management and the change of
@@ -215,6 +215,23 @@ func (c *Cluster) GetRegionByKey(key []byte) (*metapb.Region, *metapb.Peer) {
 	return nil, nil
 }
 
+// GetPrevRegionByKey returns the previous Region and its leader whose range contains the key.
+func (c *Cluster) GetPrevRegionByKey(key []byte) (*metapb.Region, *metapb.Peer) {
+	c.RLock()
+	defer c.RUnlock()
+
+	currentRegion, _ := c.GetRegionByKey(key)
+	if len(currentRegion.StartKey) == 0 {
+		return nil, nil
+	}
+	for _, r := range c.regions {
+		if bytes.Equal(r.Meta.EndKey, currentRegion.StartKey) {
+			return proto.Clone(r.Meta).(*metapb.Region), proto.Clone(r.leaderPeer()).(*metapb.Peer)
+		}
+	}
+	return nil, nil
+}
+
 // GetRegionByID returns the Region and its leader whose ID is regionID.
 func (c *Cluster) GetRegionByID(regionID uint64) (*metapb.Region, *metapb.Peer) {
 	c.RLock()
@@ -230,14 +247,14 @@ func (c *Cluster) GetRegionByID(regionID uint64) (*metapb.Region, *metapb.Peer) 
 
 // Bootstrap creates the first Region. The Stores should be in the Cluster before
 // bootstrap.
-func (c *Cluster) Bootstrap(regionID uint64, storeIDs, peerIDs []uint64, leaderStoreID uint64) {
+func (c *Cluster) Bootstrap(regionID uint64, storeIDs, peerIDs []uint64, leaderPeerID uint64) {
 	c.Lock()
 	defer c.Unlock()
 
 	if len(storeIDs) != len(peerIDs) {
 		panic("len(storeIDs) != len(peerIDs)")
 	}
-	c.regions[regionID] = newRegion(regionID, storeIDs, peerIDs, leaderStoreID)
+	c.regions[regionID] = newRegion(regionID, storeIDs, peerIDs, leaderPeerID)
 }
 
 // AddPeer adds a new Peer for the Region on the Store.
@@ -259,11 +276,11 @@ func (c *Cluster) RemovePeer(regionID, storeID uint64) {
 
 // ChangeLeader sets the Region's leader Peer. Caller should guarantee the Peer
 // exists.
-func (c *Cluster) ChangeLeader(regionID, leaderStoreID uint64) {
+func (c *Cluster) ChangeLeader(regionID, leaderPeerID uint64) {
 	c.Lock()
 	defer c.Unlock()
 
-	c.regions[regionID].changeLeader(leaderStoreID)
+	c.regions[regionID].changeLeader(leaderPeerID)
 }
 
 // GiveUpLeader sets the Region's leader to 0. The Region will have no leader
@@ -319,7 +336,7 @@ func (c *Cluster) splitRange(mvccStore MVCCStore, start, end MvccKey, count int)
 	c.createNewRegions(regionPairs, start, end)
 }
 
-// getPairsGroupByRegions groups the key value pairs into splitted regions.
+// getEntriesGroupByRegions groups the key value pairs into splitted regions.
 func (c *Cluster) getEntriesGroupByRegions(mvccStore MVCCStore, start, end MvccKey, count int) [][]Pair {
 	startTS := uint64(math.MaxUint64)
 	limit := int(math.MaxInt32)
@@ -400,7 +417,7 @@ func (c *Cluster) firstStoreID() uint64 {
 
 // getRegionsCoverRange gets regions in the cluster that has intersection with [start, end).
 func (c *Cluster) getRegionsCoverRange(start, end MvccKey) []*Region {
-	var regions []*Region
+	regions := make([]*Region, 0, len(c.regions))
 	for _, region := range c.regions {
 		onRight := bytes.Compare(end, region.Meta.StartKey) <= 0
 		onLeft := bytes.Compare(region.Meta.EndKey, start) <= 0
@@ -464,8 +481,8 @@ func (r *Region) removePeer(peerID uint64) {
 	r.incConfVer()
 }
 
-func (r *Region) changeLeader(leaderStoreID uint64) {
-	r.leader = leaderStoreID
+func (r *Region) changeLeader(leaderID uint64) {
+	r.leader = leaderID
 }
 
 func (r *Region) leaderPeer() *metapb.Peer {

@@ -14,27 +14,31 @@
 package ddl
 
 import (
+	"context"
+	"fmt"
 	"math"
+	"strconv"
 	"sync/atomic"
 	"time"
 
-	"github.com/juju/errors"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/failpoint"
+	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/distsql"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
-	"github.com/pingcap/tidb/model"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/statistics"
 	"github.com/pingcap/tidb/table"
-	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/chunk"
+	"github.com/pingcap/tidb/util/logutil"
 	"github.com/pingcap/tidb/util/mock"
 	"github.com/pingcap/tidb/util/ranger"
 	"github.com/pingcap/tipb/go-tipb"
-	log "github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
+	"go.uber.org/zap"
 )
 
 // reorgCtx is for reorganization.
@@ -55,9 +59,9 @@ type reorgCtx struct {
 }
 
 // newContext gets a context. It is only used for adding column in reorganization state.
-func (d *ddl) newContext() sessionctx.Context {
+func newContext(store kv.Storage) sessionctx.Context {
 	c := mock.NewContext()
-	c.Store = d.store
+	c.Store = store
 	c.GetSessionVars().SetStatusFlag(mysql.ServerStatusAutocommit, false)
 	c.GetSessionVars().StmtCtx.TimeZone = time.UTC
 	return c
@@ -66,7 +70,7 @@ func (d *ddl) newContext() sessionctx.Context {
 const defaultWaitReorgTimeout = 10 * time.Second
 
 // ReorgWaitTimeout is the timeout that wait ddl in write reorganization stage.
-var ReorgWaitTimeout = 1 * time.Second
+var ReorgWaitTimeout = 5 * time.Second
 
 func (rc *reorgCtx) notifyReorgCancel() {
 	atomic.StoreInt32(&rc.notifyCancelReorgJob, 1)
@@ -104,72 +108,73 @@ func (rc *reorgCtx) clean() {
 	rc.doneCh = nil
 }
 
-func (d *ddl) runReorgJob(t *meta.Meta, reorgInfo *reorgInfo, f func() error) error {
+func (w *worker) runReorgJob(t *meta.Meta, reorgInfo *reorgInfo, lease time.Duration, f func() error) error {
 	job := reorgInfo.Job
-	if d.reorgCtx.doneCh == nil {
+	if w.reorgCtx.doneCh == nil {
 		// start a reorganization job
-		d.wait.Add(1)
-		d.reorgCtx.doneCh = make(chan error, 1)
+		w.wg.Add(1)
+		w.reorgCtx.doneCh = make(chan error, 1)
 		// initial reorgCtx
-		d.reorgCtx.setRowCount(job.GetRowCount())
-		d.reorgCtx.setNextHandle(reorgInfo.StartHandle)
+		w.reorgCtx.setRowCount(job.GetRowCount())
+		w.reorgCtx.setNextHandle(reorgInfo.StartHandle)
 		go func() {
-			defer d.wait.Done()
-			d.reorgCtx.doneCh <- f()
+			defer w.wg.Done()
+			w.reorgCtx.doneCh <- f()
 		}()
 	}
 
 	waitTimeout := defaultWaitReorgTimeout
-	// if d.lease is 0, we are using a local storage,
+	// if lease is 0, we are using a local storage,
 	// and we can wait the reorganization to be done here.
-	// if d.lease > 0, we don't need to wait here because
+	// if lease > 0, we don't need to wait here because
 	// we should update some job's progress context and try checking again,
 	// so we use a very little timeout here.
-	if d.lease > 0 {
+	if lease > 0 {
 		waitTimeout = ReorgWaitTimeout
 	}
 
 	// wait reorganization job done or timeout
 	select {
-	case err := <-d.reorgCtx.doneCh:
-		rowCount, _ := d.reorgCtx.getRowCountAndHandle()
-		log.Infof("[ddl] run reorg job done, handled %d rows", rowCount)
+	case err := <-w.reorgCtx.doneCh:
+		rowCount, _ := w.reorgCtx.getRowCountAndHandle()
+		logutil.Logger(ddlLogCtx).Info("[ddl] run reorg job done", zap.Int64("handled rows", rowCount))
 		// Update a job's RowCount.
 		job.SetRowCount(rowCount)
-		d.reorgCtx.clean()
+		w.reorgCtx.clean()
 		return errors.Trace(err)
-	case <-d.quitCh:
-		log.Info("[ddl] run reorg job ddl quit")
-		d.reorgCtx.setNextHandle(0)
-		d.reorgCtx.setRowCount(0)
+	case <-w.quitCh:
+		logutil.Logger(ddlLogCtx).Info("[ddl] run reorg job quit")
+		w.reorgCtx.setNextHandle(0)
+		w.reorgCtx.setRowCount(0)
 		// We return errWaitReorgTimeout here too, so that outer loop will break.
 		return errWaitReorgTimeout
 	case <-time.After(waitTimeout):
-		rowCount, doneHandle := d.reorgCtx.getRowCountAndHandle()
+		rowCount, doneHandle := w.reorgCtx.getRowCountAndHandle()
 		// Update a job's RowCount.
 		job.SetRowCount(rowCount)
 		// Update a reorgInfo's handle.
-		err := t.UpdateDDLReorgHandle(job, doneHandle)
-		log.Infof("[ddl] run reorg job wait timeout %v, handled %d rows, current done handle %d, err %v", waitTimeout, rowCount, doneHandle, err)
+		err := t.UpdateDDLReorgStartHandle(job, doneHandle)
+		logutil.Logger(ddlLogCtx).Info("[ddl] run reorg job wait timeout", zap.Duration("waitTime", waitTimeout),
+			zap.Int64("totalAddedRowCount", rowCount), zap.Int64("doneHandle", doneHandle), zap.Error(err))
 		// If timeout, we will return, check the owner and retry to wait job done again.
 		return errWaitReorgTimeout
 	}
 }
 
-func (d *ddl) isReorgRunnable() error {
-	if d.isClosed() {
+func (w *worker) isReorgRunnable(d *ddlCtx) error {
+	if isChanClosed(w.quitCh) {
 		// Worker is closed. So it can't do the reorganizational job.
-		return errInvalidWorker.Gen("worker is closed")
+		return errInvalidWorker.GenWithStack("worker is closed")
 	}
 
-	if d.reorgCtx.isReorgCanceled() {
+	if w.reorgCtx.isReorgCanceled() {
 		// Job is cancelled. So it can't be done.
 		return errCancelledDDLJob
 	}
 
 	if !d.isOwner() {
 		// If it's not the owner, we will try later, so here just returns an error.
-		log.Infof("[ddl] the %s not the job owner", d.uuid)
+		logutil.Logger(ddlLogCtx).Info("[ddl] DDL worker is not the DDL owner", zap.String("ID", d.uuid))
 		return errors.Trace(errNotOwner)
 	}
 	return nil
@@ -177,17 +182,30 @@ func (d *ddl) isReorgRunnable() error {
 
 type reorgInfo struct {
 	*model.Job
+
 	// StartHandle is the first handle of the adding indices table.
 	StartHandle int64
 	// EndHandle is the last handle of the adding indices table.
 	EndHandle int64
-	d         *ddl
+	d         *ddlCtx
 	first     bool
+	// PhysicalTableID is used for partitioned table.
+	// DDL reorganize for a partitioned table will handle partitions one by one,
+	// PhysicalTableID is used to trace the current partition we are handling.
+	// If the table is not partitioned, PhysicalTableID would be TableID.
+	PhysicalTableID int64
 }
 
-func constructDescTableScanPB(tblInfo *model.TableInfo, pbColumnInfos []*tipb.ColumnInfo) *tipb.Executor {
+func (r *reorgInfo) String() string {
+	return "StartHandle:" + strconv.FormatInt(r.StartHandle, 10) + "," +
+		"EndHandle:" + strconv.FormatInt(r.EndHandle, 10) + "," +
+		"first:" + strconv.FormatBool(r.first) + "," +
+		"PhysicalTableID:" + strconv.FormatInt(r.PhysicalTableID, 10)
+}
+
+func constructDescTableScanPB(physicalTableID int64, pbColumnInfos []*tipb.ColumnInfo) *tipb.Executor {
 	tblScan := &tipb.TableScan{
-		TableId: tblInfo.ID,
+		TableId: physicalTableID,
 		Columns: pbColumnInfos,
 		Desc:    true,
 	}
@@ -202,7 +220,7 @@ func constructLimitPB(count uint64) *tipb.Executor {
 	return &tipb.Executor{Tp: tipb.ExecType_TypeLimit, Limit: limitExec}
 }
 
-func buildDescTableScanDAG(startTS uint64, tblInfo *model.TableInfo, columns []*model.ColumnInfo, limit uint64) (*tipb.DAGRequest, error) {
+func buildDescTableScanDAG(startTS uint64, tbl table.PhysicalTable, columns []*model.ColumnInfo, limit uint64) (*tipb.DAGRequest, error) {
 	dagReq := &tipb.DAGRequest{}
 	dagReq.StartTs = startTS
 	_, timeZoneOffset := time.Now().In(time.UTC).Zone()
@@ -212,8 +230,8 @@ func buildDescTableScanDAG(startTS uint64, tblInfo *model.TableInfo, columns []*
 	}
 	dagReq.Flags |= model.FlagInSelectStmt
 
-	pbColumnInfos := model.ColumnsToProto(columns, tblInfo.PKIsHandle)
-	tblScanExec := constructDescTableScanPB(tblInfo, pbColumnInfos)
+	pbColumnInfos := model.ColumnsToProto(columns, tbl.Meta().PKIsHandle)
+	tblScanExec := constructDescTableScanPB(tbl.GetPhysicalID(), pbColumnInfos)
 	dagReq.Executors = append(dagReq.Executors, tblScanExec)
 	dagReq.Executors = append(dagReq.Executors, constructLimitPB(limit))
 	return dagReq, nil
@@ -227,25 +245,28 @@ func getColumnsTypes(columns []*model.ColumnInfo) []*types.FieldType {
 	return colTypes
 }
 
-// builds a desc table scan upon tblInfo.
-func (d *ddl) buildDescTableScan(ctx context.Context, startTS uint64, tblInfo *model.TableInfo, columns []*model.ColumnInfo, limit uint64) (distsql.SelectResult, error) {
-	dagPB, err := buildDescTableScanDAG(startTS, tblInfo, columns, limit)
+// buildDescTableScan builds a desc table scan upon tblInfo.
+func (d *ddlCtx) buildDescTableScan(ctx context.Context, startTS uint64, tbl table.PhysicalTable, columns []*model.ColumnInfo, limit uint64) (distsql.SelectResult, error) {
+	dagPB, err := buildDescTableScanDAG(startTS, tbl, columns, limit)
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
 	ranges := ranger.FullIntRange(false)
 	var builder distsql.RequestBuilder
-	builder.SetTableRanges(tblInfo.ID, ranges, nil).
+	builder.SetTableRanges(tbl.GetPhysicalID(), ranges, nil).
 		SetDAGRequest(dagPB).
 		SetKeepOrder(true).
 		SetConcurrency(1).SetDesc(true)
 
 	builder.Request.NotFillCache = true
 	builder.Request.Priority = kv.PriorityLow
-	builder.Request.IsolationLevel = kv.SI
 
 	kvReq, err := builder.Build()
-	sctx := d.newContext()
+	if err != nil {
+		return nil, errors.Trace(err)
+	}
+
+	sctx := newContext(d.store)
 	result, err := distsql.Select(ctx, sctx, kvReq, getColumnsTypes(columns), statistics.NewQueryFeedback(0, nil, 0, false))
 	if err != nil {
 		return nil, errors.Trace(err)
@@ -254,12 +275,12 @@ func (d *ddl) buildDescTableScan(ctx context.Context, startTS uint64, tblInfo *m
 	return result, nil
 }
 
-// GetTableMaxRowID gets the last row id of the table.
-func (d *ddl) GetTableMaxRowID(startTS uint64, tblInfo *model.TableInfo) (maxRowID int64, emptyTable bool, err error) {
+// GetTableMaxRowID gets the last row id of the table partition.
+func (d *ddlCtx) GetTableMaxRowID(startTS uint64, tbl table.PhysicalTable) (maxRowID int64, emptyTable bool, err error) {
 	maxRowID = int64(math.MaxInt64)
 	var columns []*model.ColumnInfo
-	if tblInfo.PKIsHandle {
-		for _, col := range tblInfo.Columns {
+	if tbl.Meta().PKIsHandle {
+		for _, col := range tbl.Meta().Columns {
 			if mysql.HasPriKeyFlag(col.Flag) {
 				columns = []*model.ColumnInfo{col}
 				break
@@ -270,14 +291,14 @@ func (d *ddl) GetTableMaxRowID(startTS uint64, tblInfo *model.TableInfo) (maxRow
 	}
 
 	ctx := context.Background()
-	// build a desc scan of tblInfo, which limit is 1, we can use it to retrive the last handle of the table.
-	result, err := d.buildDescTableScan(ctx, startTS, tblInfo, columns, 1)
+	// build a desc scan of tblInfo, which limit is 1, we can use it to retrieve the last handle of the table.
+	result, err := d.buildDescTableScan(ctx, startTS, tbl, columns, 1)
 	if err != nil {
 		return maxRowID, false, errors.Trace(err)
 	}
 	defer terror.Call(result.Close)
 
-	chk := chunk.NewChunkWithCapacity(getColumnsTypes(columns), 1)
+	chk := chunk.New(getColumnsTypes(columns), 1, 1)
 	err = result.Next(ctx, chk)
 	if err != nil {
 		return maxRowID, false, errors.Trace(err)
@@ -292,87 +313,92 @@ func (d *ddl) GetTableMaxRowID(startTS uint64, tblInfo *model.TableInfo) (maxRow
 	return maxRowID, false, nil
 }
 
-var gofailOnceGuard bool
-
-func (d *ddl) getReorgInfo(t *meta.Meta, job *model.Job, tbl table.Table) (*reorgInfo, error) {
-	var err error
-
-	info := &reorgInfo{
-		Job: job,
-		d:   d,
-		// init start handle is math.MinInt64
-		StartHandle: math.MinInt64,
-		// init end handle is math.MaxInt64
-		EndHandle: math.MaxInt64,
-		first:     job.SnapshotVer == 0,
+// getTableRange gets the start and end handle of a table (or partition).
+func getTableRange(d *ddlCtx, tbl table.PhysicalTable, snapshotVer uint64, priority int) (startHandle, endHandle int64, err error) {
+	startHandle = math.MinInt64
+	endHandle = math.MaxInt64
+	// Get the start handle of this partition.
+	err = iterateSnapshotRows(d.store, priority, tbl, snapshotVer, math.MinInt64, math.MaxInt64, true,
+		func(h int64, rowKey kv.Key, rawRecord []byte) (bool, error) {
+			startHandle = h
+			return false, nil
+		})
+	if err != nil {
+		return 0, 0, errors.Trace(err)
 	}
+	var emptyTable bool
+	// Get the end handle of this partition.
+	endHandle, emptyTable, err = d.GetTableMaxRowID(snapshotVer, tbl)
+	if err != nil {
+		return 0, 0, errors.Trace(err)
+	}
+	if endHandle < startHandle || emptyTable {
+		logutil.Logger(ddlLogCtx).Info("[ddl] get table range, endHandle < startHandle", zap.String("table", fmt.Sprintf("%v", tbl.Meta())),
+			zap.Int64("partitionID", tbl.GetPhysicalID()), zap.Int64("endHandle", endHandle), zap.Int64("startHandle", startHandle))
+		endHandle = startHandle
+	}
+	return
+}
 
-	if info.first {
+func getReorgInfo(d *ddlCtx, t *meta.Meta, job *model.Job, tbl table.Table) (*reorgInfo, error) {
+	var (
+		err   error
+		start int64
+		end   int64
+		pid   int64
+		info  reorgInfo
+	)
+
+	if job.SnapshotVer == 0 {
+		info.first = true
 		// get the current version for reorganization if we don't have
 		var ver kv.Version
 		ver, err = d.store.CurrentVersion()
 		if err != nil {
 			return nil, errors.Trace(err)
 		} else if ver.Ver <= 0 {
-			return nil, errInvalidStoreVer.Gen("invalid storage current version %d", ver.Ver)
+			return nil, errInvalidStoreVer.GenWithStack("invalid storage current version %d", ver.Ver)
 		}
-
-		// Get the first handle of this table.
-		err = iterateSnapshotRows(d.store, tbl, ver.Ver, math.MinInt64,
-			func(h int64, rowKey kv.Key, rawRecord []byte) (bool, error) {
-				info.StartHandle = h
-				return false, nil
-			})
+		tblInfo := tbl.Meta()
+		pid = tblInfo.ID
+		var tb table.PhysicalTable
+		if pi := tblInfo.GetPartitionInfo(); pi != nil {
+			pid = pi.Definitions[0].ID
+			tb = tbl.(table.PartitionedTable).GetPartition(pid)
+		} else {
+			tb = tbl.(table.PhysicalTable)
+		}
+		start, end, err = getTableRange(d, tb, ver.Ver, job.Priority)
 		if err != nil {
-			return info, errors.Trace(err)
+			return nil, errors.Trace(err)
 		}
+		logutil.Logger(ddlLogCtx).Info("[ddl] job get table range", zap.Int64("jobID", job.ID), zap.Int64("physicalTableID", pid), zap.Int64("startHandle", start), zap.Int64("endHandle", end))
 
-		// gofail: var errorUpdateReorgHandle bool
-		// if errorUpdateReorgHandle && !gofailOnceGuard {
-		//  // only return error once.
-		//	gofailOnceGuard = true
-		// 	return info, errors.New("occur an error when update reorg handle.")
-		// }
-		err = t.UpdateDDLReorgHandle(job, info.StartHandle)
+		failpoint.Inject("errorUpdateReorgHandle", func() (*reorgInfo, error) {
+			return &info, errors.New("occur an error when update reorg handle")
+		})
+		err = t.UpdateDDLReorgHandle(job, start, end, pid)
 		if err != nil {
-			return info, errors.Trace(err)
+			return &info, errors.Trace(err)
 		}
-
+		// Update info should after data persistent.
 		job.SnapshotVer = ver.Ver
 	} else {
-		info.StartHandle, err = t.GetDDLReorgHandle(job)
+		start, end, pid, err = t.GetDDLReorgHandle(job)
 		if err != nil {
 			return nil, errors.Trace(err)
 		}
 	}
-	// tbl set to nil is only in the tests.
-	if tbl == nil {
-		return info, errors.Trace(err)
-	}
+	info.Job = job
+	info.d = d
+	info.StartHandle = start
+	info.EndHandle = end
+	info.PhysicalTableID = pid
 
-	// init the reorg meta info of job.
-	if job.ReorgMeta == nil {
-		reorgMeta := model.NewDDLReorgMeta()
-		// Gets the real table end handle, the new added row after the index being writable,
-		// has no needs to backfill.
-		endHandle, emptyTable, err1 := d.GetTableMaxRowID(job.SnapshotVer, tbl.Meta())
-		if err1 != nil {
-			return info, errors.Trace(err1)
-		}
-
-		if endHandle < info.StartHandle || emptyTable {
-			endHandle = info.StartHandle
-		}
-
-		reorgMeta.EndHandle = endHandle
-		log.Infof("[ddl] job %v get table startHandle:%v, endHandle:%v", job.ID, info.StartHandle, reorgMeta.EndHandle)
-		job.ReorgMeta = reorgMeta
-	}
-	info.EndHandle = job.ReorgMeta.EndHandle
-	return info, errors.Trace(err)
+	return &info, errors.Trace(err)
 }
 
-func (r *reorgInfo) UpdateHandle(txn kv.Transaction, handle int64) error {
+func (r *reorgInfo) UpdateReorgMeta(txn kv.Transaction, startHandle, endHandle, physicalTableID int64) error {
 	t := meta.NewMeta(txn)
-	return errors.Trace(t.UpdateDDLReorgHandle(r.Job, handle))
+	return errors.Trace(t.UpdateDDLReorgHandle(r.Job, startHandle, endHandle, physicalTableID))
 }

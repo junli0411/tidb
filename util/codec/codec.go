@@ -17,10 +17,10 @@ import (
 	"encoding/binary"
 	"time"
 
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/mysql"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
-	"github.com/pingcap/tidb/terror"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/types/json"
 	"github.com/pingcap/tidb/util/chunk"
@@ -67,20 +67,10 @@ func encode(sc *stmtctx.StatementContext, b []byte, vals []types.Datum, comparab
 			b = encodeBytes(b, vals[i].GetBytes(), comparable)
 		case types.KindMysqlTime:
 			b = append(b, uintFlag)
-			t := vals[i].GetMysqlTime()
-			// Encoding timestamp need to consider timezone.
-			// If it's not in UTC, transform to UTC first.
-			if t.Type == mysql.TypeTimestamp && sc.TimeZone != time.UTC {
-				err = t.ConvertTimeZone(sc.TimeZone, time.UTC)
-				if err != nil {
-					return nil, errors.Trace(err)
-				}
-			}
-			v, err := t.ToPackedUint()
+			b, err = EncodeMySQLTime(sc, vals[i], mysql.TypeUnspecified, b)
 			if err != nil {
-				return nil, errors.Trace(err)
+				return nil, err
 			}
-			b = EncodeUint(b, v)
 		case types.KindMysqlDuration:
 			// duration may have negative value, so we cannot use String to encode directly.
 			b = append(b, durationFlag)
@@ -90,8 +80,8 @@ func encode(sc *stmtctx.StatementContext, b []byte, vals []types.Datum, comparab
 			if hash {
 				// If hash is true, we only consider the original value of this decimal and ignore it's precision.
 				dec := vals[i].GetMysqlDecimal()
-				precision, frac := dec.PrecisionAndFrac()
-				bin, err := dec.ToBin(precision, frac)
+				var bin []byte
+				bin, err = dec.ToHashKey()
 				if err != nil {
 					return nil, errors.Trace(err)
 				}
@@ -110,7 +100,8 @@ func encode(sc *stmtctx.StatementContext, b []byte, vals []types.Datum, comparab
 			b = encodeUnsignedInt(b, uint64(vals[i].GetMysqlSet().ToNumber()), comparable)
 		case types.KindMysqlBit, types.KindBinaryLiteral:
 			// We don't need to handle errors here since the literal is ensured to be able to store in uint64 in convertToMysqlBit.
-			val, err := vals[i].GetBinaryLiteral().ToInt(sc)
+			var val uint64
+			val, err = vals[i].GetBinaryLiteral().ToInt(sc)
 			terror.Log(errors.Trace(err))
 			b = encodeUnsignedInt(b, val, comparable)
 		case types.KindMysqlJSON:
@@ -130,6 +121,29 @@ func encode(sc *stmtctx.StatementContext, b []byte, vals []types.Datum, comparab
 	}
 
 	return b, errors.Trace(err)
+}
+
+// EncodeMySQLTime encodes datum of `KindMysqlTime` to []byte.
+func EncodeMySQLTime(sc *stmtctx.StatementContext, d types.Datum, tp byte, b []byte) (_ []byte, err error) {
+	t := d.GetMysqlTime()
+	// Encoding timestamp need to consider timezone. If it's not in UTC, transform to UTC first.
+	// This is compatible with `PBToExpr > convertTime`, and coprocessor assumes the passed timestamp is in UTC as well.
+	if tp == mysql.TypeUnspecified {
+		tp = t.Type
+	}
+	if tp == mysql.TypeTimestamp && sc.TimeZone != time.UTC {
+		err = t.ConvertTimeZone(sc.TimeZone, time.UTC)
+		if err != nil {
+			return nil, err
+		}
+	}
+	var v uint64
+	v, err = t.ToPackedUint()
+	if err != nil {
+		return nil, err
+	}
+	b = EncodeUint(b, v)
+	return b, nil
 }
 
 func encodeBytes(b []byte, v []byte, comparable bool) []byte {
@@ -220,7 +234,8 @@ func encodeChunkRow(sc *stmtctx.StatementContext, b []byte, row chunk.Row, allTy
 					return nil, errors.Trace(err)
 				}
 			}
-			v, err := t.ToPackedUint()
+			var v uint64
+			v, err = t.ToPackedUint()
 			if err != nil {
 				return nil, errors.Trace(err)
 			}
@@ -228,14 +243,13 @@ func encodeChunkRow(sc *stmtctx.StatementContext, b []byte, row chunk.Row, allTy
 		case mysql.TypeDuration:
 			// duration may have negative value, so we cannot use String to encode directly.
 			b = append(b, durationFlag)
-			b = EncodeInt(b, int64(row.GetDuration(i).Duration))
+			b = EncodeInt(b, int64(row.GetDuration(i, 0).Duration))
 		case mysql.TypeNewDecimal:
 			b = append(b, decimalFlag)
 			if hash {
 				// If hash is true, we only consider the original value of this decimal and ignore it's precision.
 				dec := row.GetMyDecimal(i)
-				precision, frac := dec.PrecisionAndFrac()
-				bin, err := dec.ToBin(precision, frac)
+				bin, err := dec.ToHashKey()
 				if err != nil {
 					return nil, errors.Trace(err)
 				}
@@ -252,7 +266,8 @@ func encodeChunkRow(sc *stmtctx.StatementContext, b []byte, row chunk.Row, allTy
 			b = encodeUnsignedInt(b, uint64(row.GetSet(i).ToNumber()), comparable)
 		case mysql.TypeBit:
 			// We don't need to handle errors here since the literal is ensured to be able to store in uint64 in convertToMysqlBit.
-			val, err := types.BinaryLiteral(row.GetBytes(i)).ToInt(sc)
+			var val uint64
+			val, err = types.BinaryLiteral(row.GetBytes(i)).ToInt(sc)
 			terror.Log(errors.Trace(err))
 			b = encodeUnsignedInt(b, val, comparable)
 		case mysql.TypeJSON:
@@ -305,6 +320,43 @@ func Decode(b []byte, size int) ([]types.Datum, error) {
 	return values, nil
 }
 
+// DecodeRange decodes the range values from a byte slice that generated by EncodeKey.
+// It handles some special values like `MinNotNull` and `MaxValueDatum`.
+func DecodeRange(b []byte, size int) ([]types.Datum, error) {
+	if len(b) < 1 {
+		return nil, errors.New("invalid encoded key: length of key is zero")
+	}
+
+	var (
+		err    error
+		values = make([]types.Datum, 0, size)
+	)
+
+	for len(b) > 1 {
+		var d types.Datum
+		b, d, err = DecodeOne(b)
+		if err != nil {
+			return nil, errors.Trace(err)
+		}
+		values = append(values, d)
+	}
+
+	if len(b) == 1 {
+		switch b[0] {
+		case NilFlag:
+			values = append(values, types.Datum{})
+		case bytesFlag:
+			values = append(values, types.MinNotNullDatum())
+		// `maxFlag + 1` for PrefixNext
+		case maxFlag, maxFlag + 1:
+			values = append(values, types.MaxValueDatum())
+		default:
+			return nil, errors.Errorf("invalid encoded key flag %v", b[0])
+		}
+	}
+	return values, nil
+}
+
 // DecodeOne decodes on datum from a byte slice generated with EncodeKey or EncodeValue.
 func DecodeOne(b []byte) (remain []byte, d types.Datum, err error) {
 	if len(b) < 1 {
@@ -347,9 +399,11 @@ func DecodeOne(b []byte) (remain []byte, d types.Datum, err error) {
 			precision, frac int
 		)
 		b, dec, precision, frac, err = DecodeDecimal(b)
-		d.SetMysqlDecimal(dec)
-		d.SetLength(precision)
-		d.SetFrac(frac)
+		if err == nil {
+			d.SetMysqlDecimal(dec)
+			d.SetLength(precision)
+			d.SetFrac(frac)
+		}
 	case durationFlag:
 		var r int64
 		b, r, err = DecodeInt(b)
@@ -385,6 +439,17 @@ func CutOne(b []byte) (data []byte, remain []byte, err error) {
 		return nil, nil, errors.Trace(err)
 	}
 	return b[:l], b[l:], nil
+}
+
+// CutColumnID cuts the column ID from b.
+// It will return the remains as byte slice and column ID
+func CutColumnID(b []byte) (remain []byte, n int64, err error) {
+	if len(b) < 1 {
+		return nil, 0, errors.New("invalid encoded key")
+	}
+	// skip the flag
+	b = b[1:]
+	return DecodeVarint(b)
 }
 
 // SetRawValues set raw datum values from a row data.
@@ -596,7 +661,7 @@ func (decoder *Decoder) DecodeOne(b []byte, colIdx int, ft *types.FieldType) (re
 	if err != nil {
 		return nil, errors.Trace(err)
 	}
-	return b, errors.Trace(err)
+	return b, nil
 }
 
 func appendIntToChunk(val int64, chk *chunk.Chunk, colIdx int, ft *types.FieldType) {

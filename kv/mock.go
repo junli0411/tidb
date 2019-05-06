@@ -14,9 +14,9 @@
 package kv
 
 import (
-	"github.com/juju/errors"
+	"context"
+
 	"github.com/pingcap/tidb/store/tikv/oracle"
-	"golang.org/x/net/context"
 )
 
 // mockTxn is a txn that returns a retryAble error when called Commit.
@@ -45,12 +45,10 @@ func (t *mockTxn) LockKeys(keys ...Key) error {
 
 func (t *mockTxn) SetOption(opt Option, val interface{}) {
 	t.opts[opt] = val
-	return
 }
 
 func (t *mockTxn) DelOption(opt Option) {
 	delete(t.opts, opt)
-	return
 }
 
 func (t *mockTxn) GetOption(opt Option) interface{} {
@@ -68,11 +66,15 @@ func (t *mockTxn) Get(k Key) ([]byte, error) {
 	return nil, nil
 }
 
-func (t *mockTxn) Seek(k Key) (Iterator, error) {
+func (t *mockTxn) BatchGet(keys []Key) (map[string][]byte, error) {
 	return nil, nil
 }
 
-func (t *mockTxn) SeekReverse(k Key) (Iterator, error) {
+func (t *mockTxn) Iter(k Key, upperBound Key) (Iterator, error) {
+	return nil, nil
+}
+
+func (t *mockTxn) IterReverse(k Key) (Iterator, error) {
 	return nil, nil
 }
 
@@ -99,12 +101,6 @@ func (t *mockTxn) GetMemBuffer() MemBuffer {
 	return nil
 }
 
-func (t *mockTxn) GetSnapshot() Snapshot {
-	return &mockSnapshot{
-		store: NewMemDbBuffer(DefaultTxnMembufCap),
-	}
-}
-
 func (t *mockTxn) SetCap(cap int) {
 
 }
@@ -116,6 +112,8 @@ func (t *mockTxn) Reset() {
 func (t *mockTxn) SetVars(vars *Variables) {
 
 }
+
+func (t *mockTxn) SetAssertion(key Key, assertion AssertionType) {}
 
 // NewMockTxn new a mockTxn.
 func NewMockTxn() Transaction {
@@ -173,6 +171,18 @@ func (s *mockStorage) SupportDeleteRange() (supported bool) {
 	return false
 }
 
+func (s *mockStorage) Name() string {
+	return "KVMockStorage"
+}
+
+func (s *mockStorage) Describe() string {
+	return "KVMockStorage is a mock Store implementation, only for unittests in KV package"
+}
+
+func (s *mockStorage) ShowStatus(ctx context.Context, key string) (interface{}, error) {
+	return nil, nil
+}
+
 // MockTxn is used for test cases that need more interfaces than Transaction.
 type MockTxn interface {
 	Transaction
@@ -204,17 +214,17 @@ func (s *mockSnapshot) BatchGet(keys []Key) (map[string][]byte, error) {
 			continue
 		}
 		if err != nil {
-			return nil, errors.Trace(err)
+			return nil, err
 		}
 		m[string(k)] = v
 	}
 	return m, nil
 }
 
-func (s *mockSnapshot) Seek(k Key) (Iterator, error) {
-	return s.store.Seek(k)
+func (s *mockSnapshot) Iter(k Key, upperBound Key) (Iterator, error) {
+	return s.store.Iter(k, upperBound)
 }
 
-func (s *mockSnapshot) SeekReverse(k Key) (Iterator, error) {
-	return s.store.SeekReverse(k)
+func (s *mockSnapshot) IterReverse(k Key) (Iterator, error) {
+	return s.store.IterReverse(k)
 }

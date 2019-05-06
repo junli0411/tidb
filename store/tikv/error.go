@@ -14,15 +14,18 @@
 package tikv
 
 import (
-	"github.com/juju/errors"
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/terror"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 )
 
 var (
 	// ErrBodyMissing response body is missing error
 	ErrBodyMissing = errors.New("response body is missing")
 )
+
+// mismatchClusterID represents the message that the cluster ID of the PD client does not match the PD.
+const mismatchClusterID = "mismatch cluster id"
 
 // TiDB decides whether to retry transaction by checking if error message contains
 // string "try again later" literally.
@@ -34,11 +37,11 @@ const txnRetryableMark = "[try again later]"
 
 // MySQL error instances.
 var (
-	ErrTiKVServerTimeout  = terror.ClassTiKV.New(mysql.ErrTiKVServerTimeout, mysql.MySQLErrName[mysql.ErrTiKVServerTimeout]+txnRetryableMark)
-	ErrResolveLockTimeout = terror.ClassTiKV.New(mysql.ErrResolveLockTimeout, mysql.MySQLErrName[mysql.ErrResolveLockTimeout]+txnRetryableMark)
-	ErrPDServerTimeout    = terror.ClassTiKV.New(mysql.ErrPDServerTimeout, mysql.MySQLErrName[mysql.ErrPDServerTimeout]+"%v")
-	ErrRegionUnavailable  = terror.ClassTiKV.New(mysql.ErrRegionUnavailable, mysql.MySQLErrName[mysql.ErrRegionUnavailable]+txnRetryableMark)
-	ErrTiKVServerBusy     = terror.ClassTiKV.New(mysql.ErrTiKVServerBusy, mysql.MySQLErrName[mysql.ErrTiKVServerBusy]+txnRetryableMark)
+	ErrTiKVServerTimeout  = terror.ClassTiKV.New(mysql.ErrTiKVServerTimeout, mysql.MySQLErrName[mysql.ErrTiKVServerTimeout]+" "+txnRetryableMark)
+	ErrResolveLockTimeout = terror.ClassTiKV.New(mysql.ErrResolveLockTimeout, mysql.MySQLErrName[mysql.ErrResolveLockTimeout]+" "+txnRetryableMark)
+	ErrPDServerTimeout    = terror.ClassTiKV.New(mysql.ErrPDServerTimeout, mysql.MySQLErrName[mysql.ErrPDServerTimeout]+" %v")
+	ErrRegionUnavailable  = terror.ClassTiKV.New(mysql.ErrRegionUnavailable, mysql.MySQLErrName[mysql.ErrRegionUnavailable]+" "+txnRetryableMark)
+	ErrTiKVServerBusy     = terror.ClassTiKV.New(mysql.ErrTiKVServerBusy, mysql.MySQLErrName[mysql.ErrTiKVServerBusy]+" "+txnRetryableMark)
 	ErrGCTooEarly         = terror.ClassTiKV.New(mysql.ErrGCTooEarly, mysql.MySQLErrName[mysql.ErrGCTooEarly])
 )
 

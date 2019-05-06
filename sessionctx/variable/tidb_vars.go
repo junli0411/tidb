@@ -13,6 +13,12 @@
 
 package variable
 
+import (
+	"os"
+
+	"github.com/pingcap/parser/mysql"
+)
+
 /*
 	Steps to add a new TiDB specific system variable:
 
@@ -28,19 +34,24 @@ package variable
 
 // TiDB system variable names that only in session scope.
 const (
+	TiDBDDLSlowOprThreshold = "ddl_slow_threshold"
+
 	// tidb_snapshot is used for reading history data, the default value is empty string.
 	// The value can be a datetime string like '2017-11-11 20:20:20' or a tso string. When this variable is set, the session reads history data of that time.
 	TiDBSnapshot = "tidb_snapshot"
 
-	// tidb_import_data is used for loading data from a dump file, to speed up the loading process.
-	// When the value is set to true, unique index constraint is not checked.
-	TiDBImportingData = "tidb_import_data"
-
 	// tidb_opt_agg_push_down is used to enable/disable the optimizer rule of aggregation push down.
 	TiDBOptAggPushDown = "tidb_opt_agg_push_down"
 
+	// tidb_opt_write_row_id is used to enable/disable the operations of insert、replace and update to _tidb_rowid.
+	TiDBOptWriteRowID = "tidb_opt_write_row_id"
+
 	// Auto analyze will run if (table modify count)/(table row count) is greater than this value.
 	TiDBAutoAnalyzeRatio = "tidb_auto_analyze_ratio"
+
+	// Auto analyze will run if current time is within start time and end time.
+	TiDBAutoAnalyzeStartTime = "tidb_auto_analyze_start_time"
+	TiDBAutoAnalyzeEndTime   = "tidb_auto_analyze_end_time"
 
 	// tidb_checksum_table_concurrency is used to speed up the ADMIN CHECKSUM TABLE
 	// statement, when a table has multiple indices, those indices can be
@@ -61,6 +72,10 @@ const (
 	// tidb_batch_delete is used to enable/disable auto-split delete data. If set this option on, delete executor will automatically
 	// split data into multiple batches and use a single txn for each batch. This will be helpful when deleting large data.
 	TiDBBatchDelete = "tidb_batch_delete"
+
+	// tidb_batch_commit is used to enable/disable auto-split the transaction.
+	// If set this option on, the transaction will be committed when it reaches stmt-count-limit and starts a new transaction.
+	TiDBBatchCommit = "tidb_batch_commit"
 
 	// tidb_dml_batch_size is used to split the insert/delete data into small batches.
 	// It only takes effort when tidb_batch_insert/tidb_batch_delete is on.
@@ -89,14 +104,37 @@ const (
 	// tidb_general_log is used to log every query in the server in info level.
 	TiDBGeneralLog = "tidb_general_log"
 
-	// tidb_retry_limit is the maximun number of retries when committing a transaction.
+	// tidb_slow_log_threshold is used to set the slow log threshold in the server.
+	TiDBSlowLogThreshold = "tidb_slow_log_threshold"
+
+	// tidb_query_log_max_len is used to set the max length of the query in the log.
+	TiDBQueryLogMaxLen = "tidb_query_log_max_len"
+
+	// tidb_retry_limit is the maximum number of retries when committing a transaction.
 	TiDBRetryLimit = "tidb_retry_limit"
+
+	// tidb_disable_txn_auto_retry disables transaction auto retry.
+	TiDBDisableTxnAutoRetry = "tidb_disable_txn_auto_retry"
 
 	// tidb_enable_streaming enables TiDB to use streaming API for coprocessor requests.
 	TiDBEnableStreaming = "tidb_enable_streaming"
 
 	// tidb_optimizer_selectivity_level is used to control the selectivity estimation level.
 	TiDBOptimizerSelectivityLevel = "tidb_optimizer_selectivity_level"
+
+	// tidb_enable_table_partition is used to control table partition feature.
+	// The valid value include auto/on/off:
+	// auto: enable table partition when that feature is implemented.
+	// on: always enable table partition.
+	// off: always disable table partition.
+	TiDBEnableTablePartition = "tidb_enable_table_partition"
+
+	// TiDBCheckMb4ValueInUTF8 is used to control whether to enable the check wrong utf8 value.
+	TiDBCheckMb4ValueInUTF8 = "tidb_check_mb4_value_in_utf8"
+
+	// tidb_skip_isolation_level_check is used to control whether to return error when set unsupported transaction
+	// isolation level.
+	TiDBSkipIsolationLevelCheck = "tidb_skip_isolation_level_check"
 )
 
 // TiDB system variable names that both in session and global scope.
@@ -111,8 +149,14 @@ const (
 	// If the query has a LIMIT clause, high concurrency makes the system do much more work than needed.
 	TiDBDistSQLScanConcurrency = "tidb_distsql_scan_concurrency"
 
-	// tidb_opt_insubquery_unfold is used to enable/disable the optimizer rule of in subquery unfold.
-	TiDBOptInSubqUnFolding = "tidb_opt_insubquery_unfold"
+	// tidb_opt_insubquery_to_join_and_agg is used to enable/disable the optimizer rule of rewriting IN subquery.
+	TiDBOptInSubqToJoinAndAgg = "tidb_opt_insubq_to_join_and_agg"
+
+	// tidb_opt_correlation_threshold is a guard to enable row count estimation using column order correlation.
+	TiDBOptCorrelationThreshold = "tidb_opt_correlation_threshold"
+
+	// tidb_opt_correlation_exp_factor is an exponential factor to control heuristic approach when tidb_opt_correlation_threshold is not satisfied.
+	TiDBOptCorrelationExpFactor = "tidb_opt_correlation_exp_factor"
 
 	// tidb_index_join_batch_size is used to set the batch size of a index lookup join.
 	// The index lookup join fetches batches of data from outer executor and constructs ranges for inner executor.
@@ -143,8 +187,14 @@ const (
 	// when we need to keep the data output order the same as the order of index data.
 	TiDBIndexSerialScanConcurrency = "tidb_index_serial_scan_concurrency"
 
-	// tidb_max_chunk_capacity is used to control the max chunk size during query execution.
+	// TiDBMaxChunkSize is used to control the max chunk size during query execution.
 	TiDBMaxChunkSize = "tidb_max_chunk_size"
+
+	// TiDBInitChunkSize is used to control the init chunk size during query execution.
+	TiDBInitChunkSize = "tidb_init_chunk_size"
+
+	// tidb_enable_cascades_planner is used to control whether to enable the cascades planner.
+	TiDBEnableCascadesPlanner = "tidb_enable_cascades_planner"
 
 	// tidb_skip_utf8_check skips the UTF8 validate process, validate UTF8 has performance cost, if we can make sure
 	// the input string values are valid, we can skip the check.
@@ -158,12 +208,62 @@ const (
 	// This variable controls the worker number of projection operator.
 	TiDBProjectionConcurrency = "tidb_projection_concurrency"
 
+	// tidb_hashagg_partial_concurrency is used for hash agg executor.
+	// The hash agg executor starts multiple concurrent partial workers to do partial aggregate works.
+	TiDBHashAggPartialConcurrency = "tidb_hashagg_partial_concurrency"
+
+	// tidb_hashagg_final_concurrency is used for hash agg executor.
+	// The hash agg executor starts multiple concurrent final workers to do final aggregate works.
+	TiDBHashAggFinalConcurrency = "tidb_hashagg_final_concurrency"
+
 	// tidb_backoff_lock_fast is used for tikv backoff base time in milliseconds.
 	TiDBBackoffLockFast = "tidb_backoff_lock_fast"
+
+	// tidb_ddl_reorg_worker_cnt defines the count of ddl reorg workers.
+	TiDBDDLReorgWorkerCount = "tidb_ddl_reorg_worker_cnt"
+
+	// tidb_ddl_reorg_batch_size defines the transaction batch size of ddl reorg workers.
+	TiDBDDLReorgBatchSize = "tidb_ddl_reorg_batch_size"
+
+	// tidb_ddl_error_count_limit defines the count of ddl error limit.
+	TiDBDDLErrorCountLimit = "tidb_ddl_error_count_limit"
+
+	// tidb_ddl_reorg_priority defines the operations priority of adding indices.
+	// It can be: PRIORITY_LOW, PRIORITY_NORMAL, PRIORITY_HIGH
+	TiDBDDLReorgPriority = "tidb_ddl_reorg_priority"
+
+	// TiDBWaitTableSplitFinish defines the create table pre-split behaviour is sync or async.
+	TiDBWaitTableSplitFinish = "tidb_wait_table_split_finish"
+
+	// tidb_force_priority defines the operations priority of all statements.
+	// It can be "NO_PRIORITY", "LOW_PRIORITY", "HIGH_PRIORITY", "DELAYED"
+	TiDBForcePriority = "tidb_force_priority"
+
+	// tidb_enable_radix_join indicates to use radix hash join algorithm to execute
+	// HashJoin.
+	TiDBEnableRadixJoin = "tidb_enable_radix_join"
+
+	// tidb_constraint_check_in_place indicates to check the constraint when the SQL executing.
+	// It could hurt the performance of bulking insert when it is ON.
+	TiDBConstraintCheckInPlace = "tidb_constraint_check_in_place"
+
+	// tidb_enable_window_function is used to control whether to enable the window function.
+	TiDBEnableWindowFunction = "tidb_enable_window_function"
+
+	// TIDBOptJoinReorderThreshold defines the threshold less than which
+	// we'll choose a rather time consuming algorithm to calculate the join order.
+	TiDBOptJoinReorderThreshold = "tidb_opt_join_reorder_threshold"
+
+	// SlowQueryFile indicates which slow query log file for SLOW_QUERY table to parse.
+	TiDBSlowQueryFile = "tidb_slow_query_file"
+
+	// TiDBEnableFastAnalyze indicates to use fast analyze.
+	TiDBEnableFastAnalyze = "tidb_enable_fast_analyze"
 )
 
 // Default TiDB system variable values.
 const (
+	DefHostname                      = "localhost"
 	DefIndexLookupConcurrency        = 4
 	DefIndexLookupJoinConcurrency    = 4
 	DefIndexSerialScanConcurrency    = 1
@@ -172,16 +272,24 @@ const (
 	DefDistSQLScanConcurrency        = 15
 	DefBuildStatsConcurrency         = 4
 	DefAutoAnalyzeRatio              = 0.5
+	DefAutoAnalyzeStartTime          = "00:00 +0000"
+	DefAutoAnalyzeEndTime            = "23:59 +0000"
 	DefChecksumTableConcurrency      = 4
 	DefSkipUTF8Check                 = false
 	DefOptAggPushDown                = false
-	DefOptInSubqUnfolding            = false
+	DefOptWriteRowID                 = false
+	DefOptCorrelationThreshold       = 0.9
+	DefOptCorrelationExpFactor       = 0
+	DefOptInSubqToJoinAndAgg         = true
 	DefBatchInsert                   = false
 	DefBatchDelete                   = false
+	DefBatchCommit                   = false
 	DefCurretTS                      = 0
+	DefInitChunkSize                 = 32
 	DefMaxChunkSize                  = 1024
 	DefDMLBatchSize                  = 20000
-	DefTiDBMemQuotaQuery             = 32 << 30 // 32GB.
+	DefMaxPreparedStmtCount          = -1
+	DefWaitTimeout                   = 28800
 	DefTiDBMemQuotaHashJoin          = 32 << 30 // 32GB.
 	DefTiDBMemQuotaMergeJoin         = 32 << 30 // 32GB.
 	DefTiDBMemQuotaSort              = 32 << 30 // 32GB.
@@ -189,14 +297,41 @@ const (
 	DefTiDBMemQuotaIndexLookupReader = 32 << 30 // 32GB.
 	DefTiDBMemQuotaIndexLookupJoin   = 32 << 30 // 32GB.
 	DefTiDBMemQuotaNestedLoopApply   = 32 << 30 // 32GB.
+	DefTiDBMemQuotaDistSQL           = 32 << 30 // 32GB.
 	DefTiDBGeneralLog                = 0
 	DefTiDBRetryLimit                = 10
+	DefTiDBDisableTxnAutoRetry       = false
+	DefTiDBConstraintCheckInPlace    = false
 	DefTiDBHashJoinConcurrency       = 5
 	DefTiDBProjectionConcurrency     = 4
 	DefTiDBOptimizerSelectivityLevel = 0
+	DefTiDBDDLReorgWorkerCount       = 16
+	DefTiDBDDLReorgBatchSize         = 1024
+	DefTiDBDDLErrorCountLimit        = 512
+	DefTiDBHashAggPartialConcurrency = 4
+	DefTiDBHashAggFinalConcurrency   = 4
+	DefTiDBForcePriority             = mysql.NoPriority
+	DefTiDBUseRadixJoin              = false
+	DefEnableWindowFunction          = false
+	DefTiDBOptJoinReorderThreshold   = 0
+	DefTiDBDDLSlowOprThreshold       = 300
+	DefTiDBUseFastAnalyze            = false
+	DefTiDBSkipIsolationLevelCheck   = false
+	DefTiDBWaitTableSplitFinish      = false
 )
 
 // Process global variables.
 var (
-	ProcessGeneralLog uint32
+	ProcessGeneralLog      uint32
+	ddlReorgWorkerCounter  int32 = DefTiDBDDLReorgWorkerCount
+	maxDDLReorgWorkerCount int32 = 128
+	ddlReorgBatchSize      int32 = DefTiDBDDLReorgBatchSize
+	ddlErrorCountlimit     int64 = DefTiDBDDLErrorCountLimit
+	// Export for testing.
+	MaxDDLReorgBatchSize int32 = 10240
+	MinDDLReorgBatchSize int32 = 32
+	// DDLSlowOprThreshold is the threshold for ddl slow operations, uint is millisecond.
+	DDLSlowOprThreshold uint32 = DefTiDBDDLSlowOprThreshold
+	ForcePriority              = int32(DefTiDBForcePriority)
+	ServerHostname, _          = os.Hostname()
 )

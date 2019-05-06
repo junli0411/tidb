@@ -18,6 +18,7 @@
 package session
 
 import (
+	"context"
 	"encoding/hex"
 	"fmt"
 	"runtime/debug"
@@ -25,16 +26,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/juju/errors"
+	"github.com/pingcap/errors"
+	"github.com/pingcap/parser/auth"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/ddl"
+	"github.com/pingcap/tidb/domain"
 	"github.com/pingcap/tidb/infoschema"
-	"github.com/pingcap/tidb/mysql"
 	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/terror"
-	"github.com/pingcap/tidb/util/auth"
 	"github.com/pingcap/tidb/util/chunk"
-	log "github.com/sirupsen/logrus"
-	"golang.org/x/net/context"
+	"github.com/pingcap/tidb/util/logutil"
+	"github.com/pingcap/tidb/util/timeutil"
+	"go.uber.org/zap"
 )
 
 const (
@@ -66,6 +69,9 @@ const (
 		Create_user_priv		ENUM('N','Y') NOT NULL DEFAULT 'N',
 		Event_priv			ENUM('N','Y') NOT NULL DEFAULT 'N',
 		Trigger_priv			ENUM('N','Y') NOT NULL DEFAULT 'N',
+		Create_role_priv		ENUM('N','Y') NOT NULL DEFAULT 'N',
+		Drop_role_priv			ENUM('N','Y') NOT NULL DEFAULT 'N',
+		Account_locked			ENUM('N','Y') NOT NULL DEFAULT 'N',
 		PRIMARY KEY (Host, User));`
 	// CreateDBPrivTable is the SQL statement creates DB scope privilege table in system db.
 	CreateDBPrivTable = `CREATE TABLE if not exists mysql.db (
@@ -162,6 +168,9 @@ const (
 		modify_count bigint(64) NOT NULL DEFAULT 0,
 		version bigint(64) unsigned NOT NULL DEFAULT 0,
 		cm_sketch blob,
+		stats_ver bigint(64) NOT NULL DEFAULT 0,
+		flag bigint(64) NOT NULL DEFAULT 0,
+		correlation double NOT NULL DEFAULT 0,
 		unique index tbl(table_id, is_index, hist_id)
 	);`
 
@@ -184,7 +193,7 @@ const (
 		element_id BIGINT NOT NULL COMMENT "the schema element ID",
 		start_key VARCHAR(255) NOT NULL COMMENT "encoded in hex",
 		end_key VARCHAR(255) NOT NULL COMMENT "encoded in hex",
-		ts BIGINT NOT NULL COMMENT "timestamp in int64",
+		ts BIGINT NOT NULL COMMENT "timestamp in uint64",
 		UNIQUE KEY delete_range_index (job_id, element_id)
 	);`
 
@@ -194,7 +203,7 @@ const (
 		element_id BIGINT NOT NULL COMMENT "the schema element ID",
 		start_key VARCHAR(255) NOT NULL COMMENT "encoded in hex",
 		end_key VARCHAR(255) NOT NULL COMMENT "encoded in hex",
-		ts BIGINT NOT NULL COMMENT "timestamp in int64",
+		ts BIGINT NOT NULL COMMENT "timestamp in uint64",
 		UNIQUE KEY delete_range_done_index (job_id, element_id)
 	);`
 
@@ -206,20 +215,74 @@ const (
 		feedback blob NOT NULL,
 		index hist(table_id, is_index, hist_id)
 	);`
+
+	// CreateBindInfoTable stores the sql bind info which is used to update globalBindCache.
+	CreateBindInfoTable = `CREATE TABLE IF NOT EXISTS mysql.bind_info (
+		original_sql text NOT NULL  ,
+      	bind_sql text NOT NULL ,
+      	default_db text  NOT NULL,
+		status text NOT NULL,
+		create_time timestamp(3) NOT NULL,
+		update_time timestamp(3) NOT NULL,
+		charset text NOT NULL,
+		collation text NOT NULL,
+		INDEX sql_index(original_sql(1024),default_db(1024)) COMMENT "accelerate the speed when add global binding query",
+		INDEX time_index(update_time) COMMENT "accelerate the speed when querying with last update time"
+	) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_bin;`
+
+	// CreateRoleEdgesTable stores the role and user relationship information.
+	CreateRoleEdgesTable = `CREATE TABLE IF NOT EXISTS mysql.role_edges (
+		FROM_HOST char(60) COLLATE utf8_bin NOT NULL DEFAULT '',
+		FROM_USER char(32) COLLATE utf8_bin NOT NULL DEFAULT '',
+		TO_HOST char(60) COLLATE utf8_bin NOT NULL DEFAULT '',
+		TO_USER char(32) COLLATE utf8_bin NOT NULL DEFAULT '',
+		WITH_ADMIN_OPTION enum('N','Y') CHARACTER SET utf8 COLLATE utf8_general_ci NOT NULL DEFAULT 'N',
+		PRIMARY KEY (FROM_HOST,FROM_USER,TO_HOST,TO_USER)
+	);`
+
+	// CreateDefaultRolesTable stores the active roles for a user.
+	CreateDefaultRolesTable = `CREATE TABLE IF NOT EXISTS mysql.default_roles (
+		HOST char(60) COLLATE utf8_bin NOT NULL DEFAULT '',
+		USER char(32) COLLATE utf8_bin NOT NULL DEFAULT '',
+		DEFAULT_ROLE_HOST char(60) COLLATE utf8_bin NOT NULL DEFAULT '%',
+		DEFAULT_ROLE_USER char(32) COLLATE utf8_bin NOT NULL DEFAULT '',
+		PRIMARY KEY (HOST,USER,DEFAULT_ROLE_HOST,DEFAULT_ROLE_USER)
+	)`
+
+	// CreateStatsTopNTable stores topn data of a cmsketch with top n.
+	CreateStatsTopNTable = `CREATE TABLE if not exists mysql.stats_top_n (
+		table_id bigint(64) NOT NULL,
+		is_index tinyint(2) NOT NULL,
+		hist_id bigint(64) NOT NULL,
+		value longblob,
+		count bigint(64) UNSIGNED NOT NULL,
+		index tbl(table_id, is_index, hist_id)
+	);`
 )
 
 // bootstrap initiates system DB for a store.
 func bootstrap(s Session) {
-	b, err := checkBootstrapped(s)
-	if err != nil {
-		log.Fatal(err)
+	dom := domain.GetDomain(s)
+	for {
+		b, err := checkBootstrapped(s)
+		if err != nil {
+			logutil.Logger(context.Background()).Fatal("check bootstrap error",
+				zap.Error(err))
+		}
+		// For rolling upgrade, we can't do upgrade only in the owner.
+		if b {
+			upgrade(s)
+			return
+		}
+		// To reduce conflict when multiple TiDB-server start at the same time.
+		// Actually only one server need to do the bootstrap. So we chose DDL owner to do this.
+		if dom.DDL().OwnerManager().IsOwner() {
+			doDDLWorks(s)
+			doDMLWorks(s)
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
 	}
-	if b {
-		upgrade(s)
-		return
-	}
-	doDDLWorks(s)
-	doDMLWorks(s)
 }
 
 const (
@@ -231,7 +294,10 @@ const (
 	bootstrappedVarTrue = "True"
 	// The variable name in mysql.TiDB table.
 	// It is used for getting the version of the TiDB server which bootstrapped the store.
-	tidbServerVersionVar = "tidb_server_version" //
+	tidbServerVersionVar = "tidb_server_version"
+	// The variable name in mysql.tidb table and it will be used when we want to know
+	// system timezone.
+	tidbSystemTZ = "system_tz"
 	// Const for TiDB server version 2.
 	version2  = 2
 	version3  = 3
@@ -253,13 +319,23 @@ const (
 	version19 = 19
 	version20 = 20
 	version21 = 21
+	version22 = 22
+	version23 = 23
+	version24 = 24
+	version25 = 25
+	version26 = 26
+	version27 = 27
+	version28 = 28
+	version29 = 29
+	version30 = 30
 )
 
 func checkBootstrapped(s Session) (bool, error) {
 	//  Check if system db exists.
 	_, err := s.Execute(context.Background(), fmt.Sprintf("USE %s;", mysql.SystemDB))
 	if err != nil && infoschema.ErrDatabaseNotExists.NotEqual(err) {
-		log.Fatal(err)
+		logutil.Logger(context.Background()).Fatal("check bootstrap error",
+			zap.Error(err))
 	}
 	// Check bootstrapped variable value in TiDB table.
 	sVal, _, err := getTiDBVar(s, bootstrappedVar)
@@ -282,7 +358,7 @@ func checkBootstrapped(s Session) (bool, error) {
 // getTiDBVar gets variable value from mysql.tidb table.
 // Those variables are used by TiDB server.
 func getTiDBVar(s Session, name string) (sVal string, isNull bool, e error) {
-	sql := fmt.Sprintf(`SELECT VARIABLE_VALUE FROM %s.%s WHERE VARIABLE_NAME="%s"`,
+	sql := fmt.Sprintf(`SELECT HIGH_PRIORITY VARIABLE_VALUE FROM %s.%s WHERE VARIABLE_NAME="%s"`,
 		mysql.SystemDB, mysql.TiDBTable, name)
 	ctx := context.Background()
 	rs, err := s.Execute(ctx, sql)
@@ -294,12 +370,12 @@ func getTiDBVar(s Session, name string) (sVal string, isNull bool, e error) {
 	}
 	r := rs[0]
 	defer terror.Call(r.Close)
-	chk := r.NewChunk()
-	err = r.Next(ctx, chk)
-	if err != nil || chk.NumRows() == 0 {
+	req := r.NewRecordBatch()
+	err = r.Next(ctx, req)
+	if err != nil || req.NumRows() == 0 {
 		return "", true, errors.Trace(err)
 	}
-	row := chk.GetRow(0)
+	row := req.GetRow(0)
 	if row.IsNull(0) {
 		return "", true, nil
 	}
@@ -395,6 +471,42 @@ func upgrade(s Session) {
 		upgradeToVer21(s)
 	}
 
+	if ver < version22 {
+		upgradeToVer22(s)
+	}
+
+	if ver < version23 {
+		upgradeToVer23(s)
+	}
+
+	if ver < version24 {
+		upgradeToVer24(s)
+	}
+
+	if ver < version25 {
+		upgradeToVer25(s)
+	}
+
+	if ver < version26 {
+		upgradeToVer26(s)
+	}
+
+	if ver < version27 {
+		upgradeToVer27(s)
+	}
+
+	if ver < version28 {
+		upgradeToVer28(s)
+	}
+
+	if ver == version28 {
+		upgradeToVer29(s)
+	}
+
+	if ver < version30 {
+		upgradeToVer30(s)
+	}
+
 	updateBootstrapVer(s)
 	_, err = s.Execute(context.Background(), "COMMIT")
 
@@ -403,14 +515,17 @@ func upgrade(s Session) {
 		// Check if TiDB is already upgraded.
 		v, err1 := getBootstrapVersion(s)
 		if err1 != nil {
-			log.Fatal(err1)
+			logutil.Logger(context.Background()).Fatal("upgrade error",
+				zap.Error(err1))
 		}
 		if v >= currentBootstrapVersion {
 			// It is already bootstrapped/upgraded by a higher version TiDB server.
 			return
 		}
-		log.Errorf("[Upgrade] upgrade from %d to %d error", ver, currentBootstrapVersion)
-		log.Fatal(err)
+		logutil.Logger(context.Background()).Fatal("[Upgrade] upgrade error",
+			zap.Int64("from", ver),
+			zap.Int("to", currentBootstrapVersion),
+			zap.Error(err))
 	}
 }
 
@@ -424,7 +539,7 @@ func upgradeToVer2(s Session) {
 		value := fmt.Sprintf(`("%s", "%s")`, v, variable.SysVars[v].Value)
 		values = append(values, value)
 	}
-	sql := fmt.Sprintf("INSERT IGNORE INTO %s.%s VALUES %s;", mysql.SystemDB, mysql.GlobalVariablesTable,
+	sql := fmt.Sprintf("INSERT HIGH_PRIORITY IGNORE INTO %s.%s VALUES %s;", mysql.SystemDB, mysql.GlobalVariablesTable,
 		strings.Join(values, ", "))
 	mustExecute(s, sql)
 }
@@ -432,7 +547,7 @@ func upgradeToVer2(s Session) {
 // upgradeToVer3 updates to version 3.
 func upgradeToVer3(s Session) {
 	// Version 3 fix tx_read_only variable value.
-	sql := fmt.Sprintf("UPDATE %s.%s set variable_value = '0' where variable_name = 'tx_read_only';",
+	sql := fmt.Sprintf("UPDATE HIGH_PRIORITY %s.%s set variable_value = '0' where variable_name = 'tx_read_only';",
 		mysql.SystemDB, mysql.GlobalVariablesTable)
 	mustExecute(s, sql)
 }
@@ -451,18 +566,18 @@ func upgradeToVer5(s Session) {
 func upgradeToVer6(s Session) {
 	doReentrantDDL(s, "ALTER TABLE mysql.user ADD COLUMN `Super_priv` enum('N','Y') CHARACTER SET utf8 NOT NULL DEFAULT 'N' AFTER `Show_db_priv`", infoschema.ErrColumnExists)
 	// For reasons of compatibility, set the non-exists privilege column value to 'Y', as TiDB doesn't check them in older versions.
-	mustExecute(s, "UPDATE mysql.user SET Super_priv='Y'")
+	mustExecute(s, "UPDATE HIGH_PRIORITY mysql.user SET Super_priv='Y'")
 }
 
 func upgradeToVer7(s Session) {
 	doReentrantDDL(s, "ALTER TABLE mysql.user ADD COLUMN `Process_priv` enum('N','Y') CHARACTER SET utf8 NOT NULL DEFAULT 'N' AFTER `Drop_priv`", infoschema.ErrColumnExists)
 	// For reasons of compatibility, set the non-exists privilege column value to 'Y', as TiDB doesn't check them in older versions.
-	mustExecute(s, "UPDATE mysql.user SET Process_priv='Y'")
+	mustExecute(s, "UPDATE HIGH_PRIORITY mysql.user SET Process_priv='Y'")
 }
 
 func upgradeToVer8(s Session) {
 	// This is a dummy upgrade, it checks whether upgradeToVer7 success, if not, do it again.
-	if _, err := s.Execute(context.Background(), "SELECT `Process_priv` from mysql.user limit 0"); err == nil {
+	if _, err := s.Execute(context.Background(), "SELECT HIGH_PRIORITY `Process_priv` from mysql.user limit 0"); err == nil {
 		return
 	}
 	upgradeToVer7(s)
@@ -471,7 +586,7 @@ func upgradeToVer8(s Session) {
 func upgradeToVer9(s Session) {
 	doReentrantDDL(s, "ALTER TABLE mysql.user ADD COLUMN `Trigger_priv` enum('N','Y') CHARACTER SET utf8 NOT NULL DEFAULT 'N' AFTER `Create_user_priv`", infoschema.ErrColumnExists)
 	// For reasons of compatibility, set the non-exists privilege column value to 'Y', as TiDB doesn't check them in older versions.
-	mustExecute(s, "UPDATE mysql.user SET Trigger_priv='Y'")
+	mustExecute(s, "UPDATE HIGH_PRIORITY mysql.user SET Trigger_priv='Y'")
 }
 
 func doReentrantDDL(s Session, sql string, ignorableErrs ...error) {
@@ -482,7 +597,7 @@ func doReentrantDDL(s Session, sql string, ignorableErrs ...error) {
 		}
 	}
 	if err != nil {
-		log.Fatal(err)
+		logutil.Logger(context.Background()).Fatal("doReentrantDDL error", zap.Error(err))
 	}
 }
 
@@ -500,25 +615,25 @@ func upgradeToVer11(s Session) {
 		if terror.ErrorEqual(err, infoschema.ErrColumnExists) {
 			return
 		}
-		log.Fatal(err)
+		logutil.Logger(context.Background()).Fatal("upgradeToVer11 error", zap.Error(err))
 	}
-	mustExecute(s, "UPDATE mysql.user SET References_priv='Y'")
+	mustExecute(s, "UPDATE HIGH_PRIORITY mysql.user SET References_priv='Y'")
 }
 
 func upgradeToVer12(s Session) {
 	ctx := context.Background()
 	_, err := s.Execute(ctx, "BEGIN")
 	terror.MustNil(err)
-	sql := "SELECT user, host, password FROM mysql.user WHERE password != ''"
+	sql := "SELECT HIGH_PRIORITY user, host, password FROM mysql.user WHERE password != ''"
 	rs, err := s.Execute(ctx, sql)
 	terror.MustNil(err)
 	r := rs[0]
 	sqls := make([]string, 0, 1)
 	defer terror.Call(r.Close)
-	chk := r.NewChunk()
-	it := chunk.NewIterator4Chunk(chk)
-	err = r.Next(ctx, chk)
-	for err == nil && chk.NumRows() != 0 {
+	req := r.NewRecordBatch()
+	it := chunk.NewIterator4Chunk(req.Chunk)
+	err = r.Next(ctx, req)
+	for err == nil && req.NumRows() != 0 {
 		for row := it.Begin(); row != it.End(); row = it.Next() {
 			user := row.GetString(0)
 			host := row.GetString(1)
@@ -526,10 +641,10 @@ func upgradeToVer12(s Session) {
 			var newPass string
 			newPass, err = oldPasswordUpgrade(pass)
 			terror.MustNil(err)
-			updateSQL := fmt.Sprintf(`UPDATE mysql.user set password = "%s" where user="%s" and host="%s"`, newPass, user, host)
+			updateSQL := fmt.Sprintf(`UPDATE HIGH_PRIORITY mysql.user set password = "%s" where user="%s" and host="%s"`, newPass, user, host)
 			sqls = append(sqls, updateSQL)
 		}
-		err = r.Next(ctx, chk)
+		err = r.Next(ctx, req)
 	}
 	terror.MustNil(err)
 
@@ -537,7 +652,7 @@ func upgradeToVer12(s Session) {
 		mustExecute(s, sql)
 	}
 
-	sql = fmt.Sprintf(`INSERT INTO %s.%s VALUES ("%s", "%d", "TiDB bootstrap version.") ON DUPLICATE KEY UPDATE VARIABLE_VALUE="%d"`,
+	sql = fmt.Sprintf(`INSERT HIGH_PRIORITY INTO %s.%s VALUES ("%s", "%d", "TiDB bootstrap version.") ON DUPLICATE KEY UPDATE VARIABLE_VALUE="%d"`,
 		mysql.SystemDB, mysql.TiDBTable, tidbServerVersionVar, version12, version12)
 	mustExecute(s, sql)
 
@@ -561,10 +676,10 @@ func upgradeToVer13(s Session) {
 			if terror.ErrorEqual(err, infoschema.ErrColumnExists) {
 				continue
 			}
-			log.Fatal(err)
+			logutil.Logger(context.Background()).Fatal("upgradeToVer13 error", zap.Error(err))
 		}
 	}
-	mustExecute(s, "UPDATE mysql.user SET Create_tmp_table_priv='Y',Lock_tables_priv='Y',Create_view_priv='Y',Show_view_priv='Y',Create_routine_priv='Y',Alter_routine_priv='Y',Event_priv='Y'")
+	mustExecute(s, "UPDATE HIGH_PRIORITY mysql.user SET Create_tmp_table_priv='Y',Lock_tables_priv='Y',Create_view_priv='Y',Show_view_priv='Y',Create_routine_priv='Y',Alter_routine_priv='Y',Event_priv='Y'")
 }
 
 func upgradeToVer14(s Session) {
@@ -586,7 +701,7 @@ func upgradeToVer14(s Session) {
 			if terror.ErrorEqual(err, infoschema.ErrColumnExists) {
 				continue
 			}
-			log.Fatal(err)
+			logutil.Logger(context.Background()).Fatal("upgradeToVer14 error", zap.Error(err))
 		}
 	}
 }
@@ -595,7 +710,7 @@ func upgradeToVer15(s Session) {
 	var err error
 	_, err = s.Execute(context.Background(), CreateGCDeleteRangeTable)
 	if err != nil {
-		log.Fatal(err)
+		logutil.Logger(context.Background()).Fatal("upgradeToVer15 error", zap.Error(err))
 	}
 }
 
@@ -629,10 +744,65 @@ func upgradeToVer21(s Session) {
 	doReentrantDDL(s, "ALTER TABLE mysql.gc_delete_range DROP INDEX element_id", ddl.ErrCantDropFieldOrKey)
 }
 
+func upgradeToVer22(s Session) {
+	doReentrantDDL(s, "ALTER TABLE mysql.stats_histograms ADD COLUMN `stats_ver` bigint(64) NOT NULL DEFAULT 0", infoschema.ErrColumnExists)
+}
+
+func upgradeToVer23(s Session) {
+	doReentrantDDL(s, "ALTER TABLE mysql.stats_histograms ADD COLUMN `flag` bigint(64) NOT NULL DEFAULT 0", infoschema.ErrColumnExists)
+}
+
+// writeSystemTZ writes system timezone info into mysql.tidb
+func writeSystemTZ(s Session) {
+	sql := fmt.Sprintf(`INSERT HIGH_PRIORITY INTO %s.%s VALUES ("%s", "%s", "TiDB Global System Timezone.") ON DUPLICATE KEY UPDATE VARIABLE_VALUE="%s"`,
+		mysql.SystemDB, mysql.TiDBTable, tidbSystemTZ, timeutil.InferSystemTZ(), timeutil.InferSystemTZ())
+	mustExecute(s, sql)
+}
+
+// upgradeToVer24 initializes `System` timezone according to docs/design/2018-09-10-adding-tz-env.md
+func upgradeToVer24(s Session) {
+	writeSystemTZ(s)
+}
+
+// upgradeToVer25 updates tidb_max_chunk_size to new low bound value 32 if previous value is small than 32.
+func upgradeToVer25(s Session) {
+	sql := fmt.Sprintf("UPDATE HIGH_PRIORITY %[1]s.%[2]s SET VARIABLE_VALUE = '%[4]d' WHERE VARIABLE_NAME = '%[3]s' AND VARIABLE_VALUE < %[4]d",
+		mysql.SystemDB, mysql.GlobalVariablesTable, variable.TiDBMaxChunkSize, variable.DefInitChunkSize)
+	mustExecute(s, sql)
+}
+
+func upgradeToVer26(s Session) {
+	mustExecute(s, CreateRoleEdgesTable)
+	mustExecute(s, CreateDefaultRolesTable)
+	doReentrantDDL(s, "ALTER TABLE mysql.user ADD COLUMN `Create_role_priv` ENUM('N','Y')", infoschema.ErrColumnExists)
+	doReentrantDDL(s, "ALTER TABLE mysql.user ADD COLUMN `Drop_role_priv` ENUM('N','Y')", infoschema.ErrColumnExists)
+	doReentrantDDL(s, "ALTER TABLE mysql.user ADD COLUMN `Account_locked` ENUM('N','Y')", infoschema.ErrColumnExists)
+	// A root user will have those privileges after upgrading.
+	mustExecute(s, "UPDATE HIGH_PRIORITY mysql.user SET Create_role_priv='Y',Drop_role_priv='Y'")
+}
+
+func upgradeToVer27(s Session) {
+	doReentrantDDL(s, "ALTER TABLE mysql.stats_histograms ADD COLUMN `correlation` double NOT NULL DEFAULT 0", infoschema.ErrColumnExists)
+}
+
+func upgradeToVer28(s Session) {
+	doReentrantDDL(s, CreateBindInfoTable)
+}
+
+func upgradeToVer29(s Session) {
+	doReentrantDDL(s, "ALTER TABLE mysql.bind_info change create_time create_time timestamp(3)")
+	doReentrantDDL(s, "ALTER TABLE mysql.bind_info change update_time update_time timestamp(3)")
+	doReentrantDDL(s, "ALTER TABLE mysql.bind_info add index sql_index (original_sql(1024),default_db(1024))", ddl.ErrDupKeyName)
+}
+
+func upgradeToVer30(s Session) {
+	mustExecute(s, CreateStatsTopNTable)
+}
+
 // updateBootstrapVer updates bootstrap version variable in mysql.TiDB table.
 func updateBootstrapVer(s Session) {
 	// Update bootstrap version.
-	sql := fmt.Sprintf(`INSERT INTO %s.%s VALUES ("%s", "%d", "TiDB bootstrap version.") ON DUPLICATE KEY UPDATE VARIABLE_VALUE="%d"`,
+	sql := fmt.Sprintf(`INSERT HIGH_PRIORITY INTO %s.%s VALUES ("%s", "%d", "TiDB bootstrap version.") ON DUPLICATE KEY UPDATE VARIABLE_VALUE="%d"`,
 		mysql.SystemDB, mysql.TiDBTable, tidbServerVersionVar, currentBootstrapVersion, currentBootstrapVersion)
 	mustExecute(s, sql)
 }
@@ -679,6 +849,14 @@ func doDDLWorks(s Session) {
 	mustExecute(s, CreateGCDeleteRangeDoneTable)
 	// Create stats_feedback table.
 	mustExecute(s, CreateStatsFeedbackTable)
+	// Create role_edges table.
+	mustExecute(s, CreateRoleEdgesTable)
+	// Create default_roles table.
+	mustExecute(s, CreateDefaultRolesTable)
+	// Create bind_info table.
+	mustExecute(s, CreateBindInfoTable)
+	// Create stats_topn_store table.
+	mustExecute(s, CreateStatsTopNTable)
 }
 
 // doDMLWorks executes DML statements in bootstrap stage.
@@ -687,8 +865,8 @@ func doDMLWorks(s Session) {
 	mustExecute(s, "BEGIN")
 
 	// Insert a default user with empty password.
-	mustExecute(s, `INSERT INTO mysql.user VALUES
-		("%", "root", "", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y")`)
+	mustExecute(s, `INSERT HIGH_PRIORITY INTO mysql.user VALUES
+		("%", "root", "", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "Y", "N")`)
 
 	// Init global system variables table.
 	values := make([]string, 0, len(variable.SysVars))
@@ -699,31 +877,32 @@ func doDMLWorks(s Session) {
 			values = append(values, value)
 		}
 	}
-	sql := fmt.Sprintf("INSERT INTO %s.%s VALUES %s;", mysql.SystemDB, mysql.GlobalVariablesTable,
+	sql := fmt.Sprintf("INSERT HIGH_PRIORITY INTO %s.%s VALUES %s;", mysql.SystemDB, mysql.GlobalVariablesTable,
 		strings.Join(values, ", "))
 	mustExecute(s, sql)
 
-	sql = fmt.Sprintf(`INSERT INTO %s.%s VALUES("%s", "%s", "Bootstrap flag. Do not delete.")
+	sql = fmt.Sprintf(`INSERT HIGH_PRIORITY INTO %s.%s VALUES("%s", "%s", "Bootstrap flag. Do not delete.")
 		ON DUPLICATE KEY UPDATE VARIABLE_VALUE="%s"`,
 		mysql.SystemDB, mysql.TiDBTable, bootstrappedVar, bootstrappedVarTrue, bootstrappedVarTrue)
 	mustExecute(s, sql)
 
-	sql = fmt.Sprintf(`INSERT INTO %s.%s VALUES("%s", "%d", "Bootstrap version. Do not delete.")`,
+	sql = fmt.Sprintf(`INSERT HIGH_PRIORITY INTO %s.%s VALUES("%s", "%d", "Bootstrap version. Do not delete.")`,
 		mysql.SystemDB, mysql.TiDBTable, tidbServerVersionVar, currentBootstrapVersion)
 	mustExecute(s, sql)
 
+	writeSystemTZ(s)
 	_, err := s.Execute(context.Background(), "COMMIT")
 	if err != nil {
 		time.Sleep(1 * time.Second)
 		// Check if TiDB is already bootstrapped.
 		b, err1 := checkBootstrapped(s)
 		if err1 != nil {
-			log.Fatal(err1)
+			logutil.Logger(context.Background()).Fatal("doDMLWorks error", zap.Error(err1))
 		}
 		if b {
 			return
 		}
-		log.Fatal(err)
+		logutil.Logger(context.Background()).Fatal("doDMLWorks error", zap.Error(err))
 	}
 }
 
@@ -731,7 +910,7 @@ func mustExecute(s Session, sql string) {
 	_, err := s.Execute(context.Background(), sql)
 	if err != nil {
 		debug.PrintStack()
-		log.Fatal(err)
+		logutil.Logger(context.Background()).Fatal("mustExecute error", zap.Error(err))
 	}
 }
 

@@ -14,11 +14,13 @@
 package memory
 
 import (
+	"context"
 	"sync"
 
-	"github.com/pingcap/tidb/mysql"
-	"github.com/pingcap/tidb/terror"
-	log "github.com/sirupsen/logrus"
+	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/util/logutil"
+	"go.uber.org/zap"
 )
 
 // ActionOnExceed is the action taken when memory usage exceeds memory quota.
@@ -41,17 +43,18 @@ func (a *LogOnExceed) Action(t *Tracker) {
 	defer a.mutex.Unlock()
 	if !a.acted {
 		a.acted = true
-		log.Warnf(errMemExceedThreshold.GenByArgs(t.label, t.BytesConsumed(), t.bytesLimit, t.String()).Error())
+		logutil.Logger(context.Background()).Warn("memory exceeds quota",
+			zap.Error(errMemExceedThreshold.GenWithStackByArgs(t.label, t.BytesConsumed(), t.bytesLimit, t.String())))
 	}
 }
 
-// PanicOnExceed panics when when memory usage exceeds memory quota.
+// PanicOnExceed panics when memory usage exceeds memory quota.
 type PanicOnExceed struct {
 	mutex sync.Mutex // For synchronization.
 	acted bool
 }
 
-// Action panics when when memory usage exceeds memory quota.
+// Action panics when memory usage exceeds memory quota.
 func (a *PanicOnExceed) Action(t *Tracker) {
 	a.mutex.Lock()
 	if a.acted {
